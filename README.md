@@ -1,23 +1,27 @@
 # Macroeconomic Forecasting and Machine Learning Replication
 
-This repository contains a Python replication of the forecasting framework presented in *Macroeconomic Forecasting and Machine Learning* by Domenico Giannone and coauthors.
+This repository contains an independent Python replication of the forecasting framework developed in *Macroeconomic Forecasting and Machine Learning* by Domenico Giannone and coauthors.
 
-The project reproduces the paper's empirical pipeline, including:
+The objective of this project is to recreate the paper's empirical forecasting pipeline from scratch while closely matching the published methodology. The current implementation includes:
 
-* FRED-MD data preprocessing using the official transformation codes
-* Construction of the one-month-ahead unemployment forecasting target
-* Naive historical quantile benchmark
-* Ridge-regularized linear quantile regression implemented in PyTorch
-* Recursive expanding-window forecasting with validation-based hyperparameter selection
-* Pinball loss evaluation
+- FRED-MD preprocessing using the official transformation codes
+- Construction of the one-month-ahead unemployment forecasting target
+- FRED-MD outlier detection and removal
+- Recursive expanding-window forecasting
+- Naive historical quantile benchmark
+- Linearized deep neural network quantile regression implemented in PyTorch
+- Validation-based hyperparameter selection over network architecture and regularization
+- Pinball loss evaluation on validation and test samples
 
-The long-term goal is to replicate the paper's full forecasting framework, including the deep neural network models, and compare the reproduced results with those reported in the paper.
+The project is being extended toward a complete replication of the paper's forecasting framework, including the nonlinear deep neural network models and a detailed comparison with the published forecasting results.
 
 ## Repository Structure
 
-* `data/` – Raw FRED-MD data and processed datasets
-* `results/` – Forecasts and evaluation results
-* `archive/` – Previous implementations and experimental code
+- `data/` – Raw FRED-MD data and processed datasets
+- `results/` – Forecasts, benchmark results, and evaluation metrics
+- `archive/` – Previous implementations and experimental code
+
+## Replication Pipeline
 
 Run the scripts in the following order:
 
