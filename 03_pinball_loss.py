@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 df = pd.read_csv(
-    "Results/naive_quantile_forecasts.csv",
+    "results/naive_quantile_forecasts.csv",
     index_col=0,
     parse_dates=True
 )
@@ -37,5 +37,5 @@ print("\nOverall average pinball loss:")
 print(results["average_pinball_loss"].mean())
 
 
-results.to_csv("Results/naive_pinball_loss.csv", index=False)
+results.to_csv("results/naive_pinball_loss.csv", index=False)
 

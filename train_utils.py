@@ -10,14 +10,27 @@ def train_model(model, X_train_tensor, y_train_tensor, tau, lam, epochs, lr):
         optimizer.zero_grad()
 
         y_pred = model(X_train_tensor)
-        loss = pinball_loss_torch(y_train_tensor, y_pred, tau)
 
-        beta = model.linear.weight.squeeze()
-        ridge_penalty = lam * torch.sum(beta ** 2)
+        pinball = pinball_loss_torch(
+            y_train_tensor,
+            y_pred,
+            tau
+        )
 
-        total_loss = loss + ridge_penalty
+        if hasattr(model, "l2_penalty"):
+            l2 = model.l2_penalty()
+        else:
+            l2 = torch.sum(model.linear.weight.squeeze() ** 2)
+
+        total_loss = pinball + lam * l2
 
         total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
         optimizer.step()
 
     return model

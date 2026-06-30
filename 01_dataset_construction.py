@@ -5,7 +5,7 @@ import numpy as np
 # Load raw FRED-MD file
 # ------------------------------------------------------------
 
-raw = pd.read_csv("Data/2026-05-MD.csv")
+raw = pd.read_csv("data/2026-05-MD.csv")
 
 # Save transformation codes before dropping Transform row
 transform_row = raw[raw["sasdate"] == "Transform:"].iloc[0]
@@ -78,6 +78,28 @@ def fred_transform(x, tcode):
     else:
         raise ValueError(f"Unknown transformation code: {tcode}")
 
+def remove_outliers_fred_md(X):
+    """
+    Official FRED-MD style outlier removal:
+    replace x with NaN if |x - median| > 10 * IQR.
+    """
+    X_clean = X.copy()
+
+    for col in X_clean.columns:
+        series = X_clean[col]
+
+        median = series.median(skipna=True)
+        q1 = series.quantile(0.25)
+        q3 = series.quantile(0.75)
+        iqr = q3 - q1
+
+        if pd.isna(iqr) or iqr == 0:
+            continue
+
+        outlier_mask = (series - median).abs() > 10 * iqr
+        X_clean.loc[outlier_mask, col] = np.nan
+
+    return X_clean
 
 # ------------------------------------------------------------
 # Apply transformations to predictors
@@ -93,7 +115,7 @@ for col in df.columns:
 # MATLAB code removes first two months after transformations
 X_transformed = X_transformed.iloc[2:].copy()
 df = df.iloc[2:].copy()
-
+X_transformed = remove_outliers_fred_md(X_transformed)
 
 # ------------------------------------------------------------
 # Construct target variable from raw UNRATE level
@@ -125,9 +147,9 @@ replication_data[predictor_cols] = (
 )
 
 # Save
-replication_data.to_csv("Data/replication_dataset.csv")
+replication_data.to_csv("data/replication_dataset.csv")
 
 print("Dataset construction complete.")
 print(f"Replication dataset shape: {replication_data.shape}")
 print(f"Date range: {replication_data.index.min()} to {replication_data.index.max()}")
-print("Saved Data/replication_dataset.csv")
+print("Saved data/replication_dataset.csv")

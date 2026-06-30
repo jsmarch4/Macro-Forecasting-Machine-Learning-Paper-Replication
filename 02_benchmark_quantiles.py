@@ -3,7 +3,7 @@ import numpy as np
 
 # Load cleaned dataset
 data = pd.read_csv(
-    "Data/replication_dataset.csv",
+    "data/replication_dataset.csv",
     index_col=0,
     parse_dates=True
 )
@@ -37,6 +37,6 @@ forecast_df = pd.DataFrame(forecasts).set_index("date")
 print(forecast_df.head())
 print(forecast_df.shape)
 
-forecast_df.to_csv("Results/naive_quantile_forecasts.csv")
+forecast_df.to_csv("results/naive_quantile_forecasts.csv")
 
 print("Saved naive_quantile_forecasts.csv")
