@@ -1,0 +1,2 @@
+tau,best_nonlinear_layers,best_hidden_dim,best_alpha,best_lambda,test_loss
+0.5,1,4,1.0,0.1,0.08525717297142328

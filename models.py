@@ -3,18 +3,22 @@ from torch import nn
 
 
 class QuantileNetwork(nn.Module):
-    def __init__(self, n_features, hidden_layers=0, hidden_dim=8, alpha=1.0):
+    def __init__(self, n_features, nonlinear_layers=0, hidden_dim=8, alpha=1.0):
         super().__init__()
 
         layers = []
-        input_dim = n_features
 
-        for _ in range(hidden_layers):
-            layers.append(nn.Linear(input_dim, hidden_dim))
-            layers.append(nn.LeakyReLU(negative_slope=alpha))
-            input_dim = hidden_dim
+        if nonlinear_layers == 0:
+            layers.append(nn.Linear(n_features, 1))
+        else:
+            input_dim = n_features
 
-        layers.append(nn.Linear(input_dim, 1))
+            for _ in range(nonlinear_layers):
+                layers.append(nn.Linear(input_dim, hidden_dim))
+                layers.append(nn.LeakyReLU(negative_slope=alpha))
+                input_dim = hidden_dim
+
+            layers.append(nn.Linear(input_dim, 1))
 
         self.network = nn.Sequential(*layers)
 
