@@ -61,8 +61,6 @@ architecture_grid = [
     {"nonlinear_layers": 2, "hidden_dim": 8, "alpha": 1.0},
 ]
 
-# epochs_initial = 500
-# epochs_update = 100
 
 epochs_initial = 500
 epochs_update = 100

@@ -9,6 +9,10 @@ from train_utils import train_model, average_pinball_loss
 torch.manual_seed(123)
 np.random.seed(123)
 
+# Tried to use Apple mps GPU and was slower
+device = torch.device("cpu")
+
+
 # ------------------------------------------------------------
 # Load data
 # ------------------------------------------------------------
@@ -45,11 +49,9 @@ architecture_grid = [
     {"nonlinear_layers": 2, "hidden_dim": 8, "alpha": 1.0},
 ]
 
-# epochs_initial = 500
-# epochs_update = 100
 
-epochs_initial = 200
-epochs_update = 50
+epochs_initial = 500
+epochs_update = 100
 learning_rate = 0.001
 
 
@@ -101,17 +103,20 @@ def build_forecast_cache(start_date, end_date):
 
         X_train_tensor = torch.tensor(
             X_train_std.to_numpy(),
-            dtype=torch.float32
+            dtype=torch.float32,
+            device=device
         )
 
         y_train_tensor = torch.tensor(
             y_train.to_numpy(),
-            dtype=torch.float32
+            dtype=torch.float32,
+            device=device
         )
 
         X_forecast_tensor = torch.tensor(
             X_forecast_std.to_numpy(),
-            dtype=torch.float32
+            dtype=torch.float32,
+            device=device
         )
 
         cache.append({
@@ -157,6 +162,7 @@ def recursive_forecasts(
                 hidden_dim=hidden_dim,
                 alpha=alpha
             )
+            model = model.to(device)
 
             initialize_model(model, y_train_series, tau)
 
@@ -210,11 +216,9 @@ test_cache = build_forecast_cache(
     test_end
 )
 
-validation_results = []
 
-total_models = len(architecture_grid) * len(lambda_grid)
-model_number = 0
 all_test_results = []
+all_validation_results = []
 
 for tau in quantiles:
     print("\n" + "=" * 80)
@@ -222,6 +226,8 @@ for tau in quantiles:
     print("=" * 80)
 
     validation_results = []
+    total_models = len(architecture_grid) * len(lambda_grid)
+    model_number = 0
 
     for arch in architecture_grid:
         nonlinear_layers = arch["nonlinear_layers"]
@@ -253,6 +259,7 @@ for tau in quantiles:
             val_loss = average_pinball_loss(val_forecasts, tau)
 
             validation_results.append({
+                "model_family": "linear_activation",
                 "tau": tau,
                 "nonlinear_layers": nonlinear_layers,
                 "hidden_dim": hidden_dim,
@@ -321,6 +328,13 @@ all_test_results_df = pd.DataFrame(all_test_results)
 
 all_test_results_df.to_csv(
     "results/linear_activation_all_quantiles_test_results.csv",
+    index=False
+)
+
+all_validation_results_df = pd.DataFrame(all_validation_results)
+
+all_validation_results_df.to_csv(
+    "results/linear_activation_hyperparameter_search_results.csv",
     index=False
 )
 
