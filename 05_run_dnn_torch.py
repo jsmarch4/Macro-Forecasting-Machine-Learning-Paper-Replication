@@ -23,7 +23,7 @@ X, y = load_replication_data()
 # Experiment settings
 # ------------------------------------------------------------
 
-quantiles = [0.50]
+quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 
 validation_start = "1980-01-01"
 validation_end = "1999-12-01"
@@ -231,6 +231,10 @@ test_cache = build_forecast_cache(
 
 
 all_test_results = []
+all_validation_results = []
+
+best_validation_loss = float("inf")
+best_validation_forecasts = None
 
 for tau in quantiles:
     print("\n" + "=" * 80)
@@ -271,6 +275,7 @@ for tau in quantiles:
             val_loss = average_pinball_loss(val_forecasts, tau)
 
             validation_results.append({
+                "model_family": "dnn",
                 "tau": tau,
                 "nonlinear_layers": nonlinear_layers,
                 "hidden_dim": hidden_dim,
@@ -278,6 +283,11 @@ for tau in quantiles:
                 "lambda": lam,
                 "validation_loss": val_loss
             })
+
+            if val_loss < best_validation_loss:
+                best_validation_loss = val_loss
+                best_validation_forecasts = val_forecasts.copy()
+
 
 
     validation_results_df = pd.DataFrame(validation_results)
@@ -306,6 +316,12 @@ for tau in quantiles:
         f"\n  validation loss = {best_row['validation_loss']:.6f}"
     )
 
+
+    best_validation_forecasts.to_csv(
+    f"results/dnn_q{tau:.2f}_validation_forecasts.csv"
+        )
+    
+    
     print("\nRunning out-of-sample test...")
 
     test_forecasts = recursive_forecasts(
@@ -339,6 +355,13 @@ all_test_results_df = pd.DataFrame(all_test_results)
 
 all_test_results_df.to_csv(
     "results/dnn_all_quantiles_test_results.csv",
+    index=False
+)
+
+all_validation_results_df = pd.DataFrame(all_validation_results)
+
+all_validation_results_df.to_csv(
+    "results/dnn_hyperparameter_search_results.csv",
     index=False
 )
 
