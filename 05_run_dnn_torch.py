@@ -242,6 +242,9 @@ for tau in quantiles:
     print("=" * 80)
 
     validation_results = []
+    best_validation_loss = float("inf")
+    best_validation_forecasts = None
+
     total_models = len(architecture_grid) * len(lambda_grid)
     model_number = 0
 
