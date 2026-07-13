@@ -8,9 +8,22 @@ __pycache__/
 # VS Code
 .vscode/
 
-# Generated outputs
-results/
-figures/
-
 # Jupyter
 .ipynb_checkpoints/
+
+# Ignore all generated result files by default
+results/*
+
+# Keep selected summary results
+!results/naive_pinball_loss.csv
+!results/dnn_all_quantiles_test_results.csv
+!results/linear_activation_all_quantiles_test_results.csv
+!results/dnn_best_validation_summary.csv
+!results/dnn_validation_loss_by_alpha.csv
+!results/dnn_hyperparameter_search_results.csv
+!results/linear_activation_hyperparameter_search_results.csv
+
+# Keep figures
+!figures/
+!figures/*.png
+!figures/*.pdf
