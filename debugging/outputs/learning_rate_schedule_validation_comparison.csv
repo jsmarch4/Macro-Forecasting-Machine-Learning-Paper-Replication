@@ -1,0 +1,7 @@
+model,tau,base_learning_rate,epochs_initial,epochs_update,schedule,decay_gamma,decay_step_fraction,scheduler_reset_each_window,validation_pinball_loss,rank_within_model
+median_linear,0.5,0.001,500,100,constant,1.0,,True,0.069851267838773,1
+median_linear,0.5,0.001,500,100,single_decay_0.1,0.1,0.5,True,0.0706191319669597,2
+median_linear,0.5,0.001,500,100,single_decay_0.3,0.3,0.5,True,0.07103399442043155,3
+upper_tail_leaky_relu,0.9,0.001,750,150,constant,1.0,,True,0.03712481454449395,1
+upper_tail_leaky_relu,0.9,0.001,750,150,single_decay_0.1,0.1,0.5,True,0.04129479003340627,2
+upper_tail_leaky_relu,0.9,0.001,750,150,single_decay_0.3,0.3,0.5,True,0.041582301398428785,3

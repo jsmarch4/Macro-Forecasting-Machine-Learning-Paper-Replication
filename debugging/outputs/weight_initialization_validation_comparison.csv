@@ -1,0 +1,9 @@
+model,tau,learning_rate,epochs_initial,epochs_update,initialization,validation_pinball_loss,rank_within_model
+median_linear,0.5,0.001,500,100,small_normal,0.069851267838773,1
+median_linear,0.5,0.001,500,100,pytorch_default,0.07049402859605229,2
+median_linear,0.5,0.001,500,100,xavier_normal,0.07111622861508901,3
+median_linear,0.5,0.001,500,100,xavier_uniform,0.07123825137930302,4
+upper_tail_leaky_relu,0.9,0.001,750,150,small_normal,0.03712481454449395,1
+upper_tail_leaky_relu,0.9,0.001,750,150,xavier_uniform,0.039230767255338514,2
+upper_tail_leaky_relu,0.9,0.001,750,150,xavier_normal,0.0400258057747657,3
+upper_tail_leaky_relu,0.9,0.001,750,150,pytorch_default,0.04125625295223047,4

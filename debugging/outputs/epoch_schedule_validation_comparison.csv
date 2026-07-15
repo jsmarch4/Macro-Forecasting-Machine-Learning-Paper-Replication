@@ -1,0 +1,7 @@
+model,tau,learning_rate,epochs_initial,epochs_update,validation_pinball_loss,rank_within_model
+median_linear,0.5,0.001,500,100,0.069851267838773,1
+median_linear,0.5,0.001,1000,200,0.06992171723453794,2
+median_linear,0.5,0.001,750,150,0.07138601162383566,3
+upper_tail_leaky_relu,0.9,0.001,750,150,0.03712481454449395,1
+upper_tail_leaky_relu,0.9,0.001,500,100,0.04023907196211317,2
+upper_tail_leaky_relu,0.9,0.001,1000,200,0.04151499379239976,3

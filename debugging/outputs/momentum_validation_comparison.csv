@@ -1,0 +1,7 @@
+model,tau,learning_rate,epochs_initial,epochs_update,momentum,momentum_reset_each_window,validation_pinball_loss,rank_within_model
+median_linear,0.5,0.001,500,100,0.5,True,0.06982556911961486,1
+median_linear,0.5,0.001,500,100,0.0,True,0.069851267838773,2
+median_linear,0.5,0.001,500,100,0.9,True,0.07150946286691276,3
+upper_tail_leaky_relu,0.9,0.001,750,150,0.0,True,0.03712481454449395,1
+upper_tail_leaky_relu,0.9,0.001,750,150,0.9,True,0.038954017377768956,2
+upper_tail_leaky_relu,0.9,0.001,750,150,0.5,True,0.0421453688290591,3

@@ -294,6 +294,7 @@ for tau in quantiles:
 
 
     validation_results_df = pd.DataFrame(validation_results)
+    all_validation_results.extend(validation_results)
 
     validation_results_df.to_csv(
         f"results/dnn_q{tau:.2f}_validation_results.csv",

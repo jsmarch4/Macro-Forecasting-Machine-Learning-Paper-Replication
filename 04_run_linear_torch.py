@@ -226,6 +226,9 @@ for tau in quantiles:
     print("=" * 80)
 
     validation_results = []
+    best_validation_loss = float("inf")
+    best_validation_forecasts = None
+
     total_models = len(architecture_grid) * len(lambda_grid)
     model_number = 0
 
@@ -268,8 +271,13 @@ for tau in quantiles:
                 "validation_loss": val_loss
             })
 
+            if val_loss < best_validation_loss:
+                best_validation_loss = val_loss
+                best_validation_forecasts = val_forecasts.copy()
+
 
     validation_results_df = pd.DataFrame(validation_results)
+    all_validation_results.extend(validation_results)
 
     validation_results_df.to_csv(
         f"results/linear_activation_q{tau:.2f}_validation_results.csv",
@@ -293,6 +301,10 @@ for tau in quantiles:
         f"\n  alpha = {best_alpha}"
         f"\n  lambda = {best_lambda}"
         f"\n  validation loss = {best_row['validation_loss']:.6f}"
+    )
+
+    best_validation_forecasts.to_csv(
+        f"results/linear_activation_q{tau:.2f}_validation_forecasts.csv"
     )
 
     print("\nRunning out-of-sample test...")
