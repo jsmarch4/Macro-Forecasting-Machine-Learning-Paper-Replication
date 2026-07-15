@@ -93,7 +93,7 @@ def remove_outliers_fred_md(X):
         q3 = series.quantile(0.75)
         iqr = q3 - q1
 
-        if pd.isna(iqr) or iqr == 0:
+        if pd.isna(iqr):
             continue
 
         outlier_mask = (series - median).abs() > 10 * iqr

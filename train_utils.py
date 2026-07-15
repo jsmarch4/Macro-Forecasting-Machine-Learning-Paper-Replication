@@ -4,7 +4,7 @@ from losses import pinball_loss_torch, pinball_loss_numpy
 
 
 def train_model(model, X_train_tensor, y_train_tensor, tau, lam, epochs, lr):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr)
 
     for epoch in range(epochs):
         optimizer.zero_grad()
@@ -26,10 +26,10 @@ def train_model(model, X_train_tensor, y_train_tensor, tau, lam, epochs, lr):
 
         total_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=1.0
-        )
+        # torch.nn.utils.clip_grad_norm_(
+        #     model.parameters(),
+        #     max_norm=1.0
+        # )
 
         optimizer.step()
 

@@ -23,7 +23,7 @@ for tau in quantiles:
     })
 
 summary = pd.DataFrame(rows)
-summary.to_csv(RESULTS_DIR / "dnn_best_validation_summary.csv", index=False)
+summary.to_csv(RESULTS_DIR / "best_hyperparameters_by_quantile.csv", index=False)
 
 print("\nBest validation model by quantile")
 print(summary)
@@ -48,6 +48,6 @@ alpha_summary = pd.concat(alpha_summary)
 print(alpha_summary)
 
 alpha_summary.to_csv(
-    RESULTS_DIR / "dnn_validation_loss_by_alpha.csv",
+    RESULTS_DIR / "average_validation_loss_by_activation.csv",
     index=False
 )
