@@ -23,7 +23,7 @@ TEST_START = pd.Timestamp("2000-01-01")
 PLOT_END = pd.Timestamp("2024-01-01")
 
 # Replace this with the exact target name when you are ready.
-TARGET_LABEL = "Unemployment Rate (%)"
+TARGET_LABEL = "Monthly % Change in Unemployment Rate"
 
 # Zoomed view limits
 ZOOM_Y_MIN = -1.0
@@ -263,7 +263,7 @@ def make_plot(df, title, output_name, y_limits=None):
     plt.tight_layout()
 
     png_file = FIGURES_DIR / f"{output_name}.png"
-    pdf_file = FIGURES_DIR / f"{output_name}.pdf"
+
 
     fig.savefig(
         png_file,
@@ -271,16 +271,11 @@ def make_plot(df, title, output_name, y_limits=None):
         bbox_inches="tight"
     )
 
-    fig.savefig(
-        pdf_file,
-        bbox_inches="tight"
-    )
 
-    plt.show()
     plt.close(fig)
 
     print(f"Saved PNG: {png_file}")
-    print(f"Saved PDF: {pdf_file}")
+
 
 
 # ------------------------------------------------------------
@@ -296,12 +291,18 @@ def main():
         f"to {forecasts['date'].max():%Y-%m}."
     )
 
+    make_plot(
+        df=forecasts,
+        title="Deep Neural Network Density Forecasts",
+        output_name="dnn_figure4_full",
+        y_limits=None
+    )
 
     make_plot(
         df=forecasts,
-        title="Recursive Density Forecasts of U.S. Unemployment — Zoomed View",
-        output_name=f"{MODEL_PREFIX}_figure4_zoomed",
-        y_limits=(ZOOM_Y_MIN, ZOOM_Y_MAX)
+        title="Deep Neural Network Density Forecasts — Zoomed View",
+        output_name="dnn_figure4_zoomed",
+        y_limits=(-1.0, 1.0)
     )
 
 
