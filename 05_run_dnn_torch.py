@@ -62,8 +62,8 @@ architecture_grid = [
 ]
 
 
-epochs_initial = 500
-epochs_update = 100
+epochs_initial = 750
+epochs_update = 150
 learning_rate = 0.001
 
 

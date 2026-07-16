@@ -32,8 +32,8 @@ test_start = "2000-01-01"
 test_end = "2024-01-01"
 
 # Small grid for now. Paper-style full grid later:
-# lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
-lambda_grid = [0.1, 1.0, 10.0]
+lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
+# lambda_grid = [0.1, 1.0, 10.0]
 
 # Linear activation case: alpha = 1.0
 # nonlinear_layers = 0 means plain linear model.
@@ -293,6 +293,14 @@ for tau in quantiles:
     best_alpha = float(best_row["alpha"])
     best_lambda = float(best_row["lambda"])
 
+    if best_validation_forecasts is None:
+        raise RuntimeError(
+            f"No validation forecasts were stored for tau={tau}."
+        )
+
+    best_validation_forecasts.to_csv(
+        f"results/linear_activation_q{tau:.2f}_validation_forecasts.csv"
+    )
 
     print(
         f"\nBest validation model:"
@@ -301,10 +309,6 @@ for tau in quantiles:
         f"\n  alpha = {best_alpha}"
         f"\n  lambda = {best_lambda}"
         f"\n  validation loss = {best_row['validation_loss']:.6f}"
-    )
-
-    best_validation_forecasts.to_csv(
-        f"results/linear_activation_q{tau:.2f}_validation_forecasts.csv"
     )
 
     print("\nRunning out-of-sample test...")
