@@ -1,6 +1,11 @@
+# Virtual environment
+.venv/
+
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
 
 # macOS
 .DS_Store
@@ -8,22 +13,11 @@ __pycache__/
 # VS Code
 .vscode/
 
-# Jupyter
-.ipynb_checkpoints/
+# Slurm
+slurm_logs/
+slurm-*.out
 
-# Ignore all generated result files by default
-results/*
-
-# Keep selected summary results
-!results/naive_pinball_loss.csv
-!results/dnn_all_quantiles_test_results.csv
-!results/linear_activation_all_quantiles_test_results.csv
-!results/dnn_best_validation_summary.csv
-!results/dnn_validation_loss_by_alpha.csv
-!results/dnn_hyperparameter_search_results.csv
-!results/linear_activation_hyperparameter_search_results.csv
-
-# Keep figures
-!figures/
-!figures/*.png
-!figures/*.pdf
+# Generated outputs
+results/
+figures/
+debugging/

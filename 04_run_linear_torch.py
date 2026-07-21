@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import argparse
 
 from models import QuantileNetwork
 from data_utils import load_replication_data, standardize_train_forecast
@@ -23,7 +24,20 @@ X, y = load_replication_data()
 # Experiment settings
 # ------------------------------------------------------------
 
-quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+ALL_QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--quantile",
+    type=float,
+    choices=ALL_QUANTILES,
+    required=True,
+    help="Quantile to estimate."
+)
+args = parser.parse_args()
+
+quantiles = [args.quantile]
+
 
 validation_start = "1980-01-01"
 validation_end = "1999-12-01"
@@ -32,8 +46,8 @@ test_start = "2000-01-01"
 test_end = "2024-01-01"
 
 # Small grid for now. Paper-style full grid later:
-lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
-# lambda_grid = [0.1, 1.0, 10.0]
+# lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
+lambda_grid = [0.1, 1.0, 10.0]
 
 # Linear activation case: alpha = 1.0
 # nonlinear_layers = 0 means plain linear model.
@@ -342,17 +356,23 @@ for tau in quantiles:
 
 all_test_results_df = pd.DataFrame(all_test_results)
 
+tau = args.quantile
+
 all_test_results_df.to_csv(
-    "results/linear_activation_all_quantiles_test_results.csv",
+    f"results/linear_activation_q{tau:.2f}_test_summary.csv",
     index=False
 )
 
 all_validation_results_df = pd.DataFrame(all_validation_results)
 
 all_validation_results_df.to_csv(
-    "results/linear_activation_hyperparameter_search_results.csv",
+    f"results/linear_activation_q{tau:.2f}_search_summary.csv",
     index=False
 )
+
+
+
+
 
 print("\nFinal Results")
 print("-" * 60)

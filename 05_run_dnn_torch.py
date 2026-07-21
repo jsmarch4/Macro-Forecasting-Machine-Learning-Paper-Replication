@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import argparse
 
 from models import QuantileNetwork
 from data_utils import load_replication_data, standardize_train_forecast
@@ -23,7 +24,19 @@ X, y = load_replication_data()
 # Experiment settings
 # ------------------------------------------------------------
 
-quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+ALL_QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--quantile",
+    type=float,
+    choices=ALL_QUANTILES,
+    required=True,
+    help="Quantile to estimate."
+)
+args = parser.parse_args()
+
+quantiles = [args.quantile]
 
 validation_start = "1980-01-01"
 validation_end = "1999-12-01"
@@ -233,8 +246,6 @@ test_cache = build_forecast_cache(
 all_test_results = []
 all_validation_results = []
 
-best_validation_loss = float("inf")
-best_validation_forecasts = None
 
 for tau in quantiles:
     print("\n" + "=" * 80)
@@ -320,6 +331,10 @@ for tau in quantiles:
         f"\n  validation loss = {best_row['validation_loss']:.6f}"
     )
 
+    if best_validation_forecasts is None:
+        raise RuntimeError(
+            f"No validation forecasts were stored for tau={tau}."
+        )
 
     best_validation_forecasts.to_csv(
     f"results/dnn_q{tau:.2f}_validation_forecasts.csv"
@@ -357,15 +372,17 @@ for tau in quantiles:
 
 all_test_results_df = pd.DataFrame(all_test_results)
 
+tau = args.quantile
+
 all_test_results_df.to_csv(
-    "results/dnn_all_quantiles_test_results.csv",
+    f"results/dnn_q{tau:.2f}_test_summary.csv",
     index=False
 )
 
 all_validation_results_df = pd.DataFrame(all_validation_results)
 
 all_validation_results_df.to_csv(
-    "results/dnn_hyperparameter_search_results.csv",
+    f"results/dnn_q{tau:.2f}_search_summary.csv",
     index=False
 )
 
