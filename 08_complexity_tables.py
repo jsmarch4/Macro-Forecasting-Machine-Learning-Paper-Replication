@@ -6,21 +6,18 @@ tables for BOTH:
     1. linear-activation networks
     2. deep neural networks
 
-This version intentionally uses the existing THREE-lambda grid:
+The candidate grid remains:
     lambda in {0.1, 1.0, 10.0}
 
-IMPORTANT INTERPRETATION
-------------------------
-The paper is not fully explicit about the denominator used to normalize the
-complexity index r across architectures. This script uses the practical,
-common-scale interpretation:
+The complexity reference is computed separately at lambda = 0:
 
-    r(candidate, tau, family)
+    r(candidate)
         = fitted_variance(candidate)
-          / max_fitted_variance(tau, family)
+          / fitted_variance(same architecture, lambda=0)
 
-where fitted_variance is computed from fitted values on the fixed initial
-pre-validation sample (all observations before 1980-01).
+Fitted variance is computed from fitted values on the fixed initial
+pre-validation sample (all observations before 1980-01). Lambda = 0 is not
+added to the validation-selection grid.
 
 Thus:
     r approximately 0 -> almost-flat fitted quantile
@@ -69,7 +66,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from data_utils import load_replication_data, standardize_train_forecast
+from data_utils import (
+    load_replication_data,
+    standardize_train_forecast,
+    standardize_target_train_forecast,
+)
 from losses import pinball_loss_numpy
 from models import QuantileNetwork
 from train_utils import train_model
@@ -216,8 +217,16 @@ def build_forecast_cache(
 
     for i, date in enumerate(dates):
         X_train_raw = X.loc[:date].iloc[:-1]
-        y_train = y.loc[:date].iloc[:-1]
+        y_train_raw = y.loc[:date].iloc[:-1]
+        actual_raw = float(y.loc[date])
         X_forecast_raw = X.loc[[date]]
+
+        y_train_std, actual_std, y_mean, y_std = (
+            standardize_target_train_forecast(
+                y_train_raw,
+                actual_raw,
+            )
+        )
 
         X_train_std, X_forecast_std = standardize_train_forecast(
             X_train_raw,
@@ -232,7 +241,7 @@ def build_forecast_cache(
                 device=DEVICE,
             ),
             "y_train_tensor": torch.tensor(
-                y_train.to_numpy(),
+                y_train_std.to_numpy(),
                 dtype=torch.float32,
                 device=DEVICE,
             ),
@@ -241,8 +250,11 @@ def build_forecast_cache(
                 dtype=torch.float32,
                 device=DEVICE,
             ),
-            "y_train_series": y_train,
-            "actual": float(y.loc[date]),
+            "y_train_series": y_train_std,
+            "actual_std": float(actual_std),
+            "actual_raw": actual_raw,
+            "y_mean": float(y_mean),
+            "y_std": float(y_std),
             "n_features": X_train_std.shape[1],
         })
 
@@ -288,14 +300,19 @@ def recursive_forecasts(
         )
 
         with torch.no_grad():
-            forecast = float(
+            forecast_std = float(
                 model(item["X_forecast_tensor"]).item()
             )
 
+        forecast_raw = (
+            forecast_std * item["y_std"]
+            + item["y_mean"]
+        )
+
         rows.append({
             "date": item["date"],
-            "actual": item["actual"],
-            f"q{spec.tau:.2f}": forecast,
+            "actual": item["actual_raw"],
+            f"q{spec.tau:.2f}": forecast_raw,
             "family": spec.family,
             "tau": spec.tau,
             "nonlinear_layers": spec.nonlinear_layers,
@@ -337,12 +354,17 @@ def initial_sample_tensors() -> tuple[
     if X_initial_raw.empty:
         raise ValueError("No observations exist before 1980-01.")
 
-    mean = X_initial_raw.mean()
-    std = X_initial_raw.std()
-    std = std.replace(0, 1)
-    std = std.mask(std < 1e-6, 1)
+    # Apply the same predictor normalization used by 04 and 05.
+    X_initial_std, _ = standardize_train_forecast(
+        X_initial_raw,
+        X_initial_raw,
+    )
 
-    X_initial_std = (X_initial_raw - mean) / std
+    # Apply the same target standardization used by 04 and 05.
+    y_initial_std, _, _, _ = standardize_target_train_forecast(
+        y_initial,
+        float(y_initial.iloc[-1]),
+    )
 
     X_tensor = torch.tensor(
         X_initial_std.to_numpy(),
@@ -350,12 +372,12 @@ def initial_sample_tensors() -> tuple[
         device=DEVICE,
     )
     y_tensor = torch.tensor(
-        y_initial.to_numpy(),
+        y_initial_std.to_numpy(),
         dtype=torch.float32,
         device=DEVICE,
     )
 
-    return X_tensor, y_tensor, y_initial
+    return X_tensor, y_tensor, y_initial_std
 
 
 def fitted_variance_for_candidate(spec: ModelSpec) -> float:
@@ -457,10 +479,18 @@ def read_three_lambda_search(family: str) -> pd.DataFrame:
 
 def build_complexity_candidates(family: str) -> pd.DataFrame:
     """
-    Add fitted variance and achieved r to every stored candidate.
+    Compute each candidate's fitted variance and normalize it by the
+    fitted variance of the same architecture at lambda = 0.
+
+    Lambda = 0 is used only as the complexity reference. It is not added
+    to the validation-selection grid.
     """
     search = read_three_lambda_search(family)
-    variances = []
+    candidate_variances = []
+    reference_variances = []
+
+    # Avoid fitting the same lambda=0 reference once for every penalized lambda.
+    zero_variance_cache: dict[tuple, float] = {}
 
     total = len(search)
 
@@ -482,25 +512,55 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
             f"lambda={spec.lam}"
         )
 
-        variances.append(
-            fitted_variance_for_candidate(spec)
+        candidate_variance = fitted_variance_for_candidate(spec)
+        candidate_variances.append(candidate_variance)
+
+        architecture_key = (
+            spec.family,
+            round(spec.tau, 8),
+            spec.nonlinear_layers,
+            spec.hidden_dim,
+            round(spec.alpha, 8),
         )
 
-    search["initial_fitted_variance"] = variances
+        if architecture_key not in zero_variance_cache:
+            zero_spec = ModelSpec(
+                family=spec.family,
+                tau=spec.tau,
+                nonlinear_layers=spec.nonlinear_layers,
+                hidden_dim=spec.hidden_dim,
+                alpha=spec.alpha,
+                lam=0.0,
+            )
 
-    # Common scale across architectures, separately by family and tau.
-    maximum_variance = search.groupby("tau")[
-        "initial_fitted_variance"
-    ].transform("max")
+            print(
+                "  Computing lambda=0 reference for "
+                f"layers={spec.nonlinear_layers}, "
+                f"dim={spec.hidden_dim}, alpha={spec.alpha}"
+            )
 
-    search["maximum_variance_within_tau"] = maximum_variance
+            zero_variance_cache[architecture_key] = (
+                fitted_variance_for_candidate(zero_spec)
+            )
+
+        reference_variances.append(
+            zero_variance_cache[architecture_key]
+        )
+
+    search["initial_fitted_variance"] = candidate_variances
+    search["lambda_zero_fitted_variance"] = reference_variances
+
+    denominator = search["lambda_zero_fitted_variance"].to_numpy()
+    numerator = search["initial_fitted_variance"].to_numpy()
 
     search["achieved_r"] = np.where(
-        maximum_variance > 0,
-        search["initial_fitted_variance"] / maximum_variance,
+        denominator > 0,
+        numerator / denominator,
         0.0,
     )
 
+    # The theoretical index lies in [0, 1]. Small overshoots can occur
+    # because the neural-network fits are numerical rather than exact.
     search["achieved_r"] = search["achieved_r"].clip(0.0, 1.0)
 
     output_path = (
@@ -565,8 +625,8 @@ def map_target_complexities(
                 "initial_fitted_variance": float(
                     chosen["initial_fitted_variance"]
                 ),
-                "maximum_variance_within_tau": float(
-                    chosen["maximum_variance_within_tau"]
+                "lambda_zero_fitted_variance": float(
+                    chosen["lambda_zero_fitted_variance"]
                 ),
                 "validation_loss": float(
                     chosen["validation_loss"]
