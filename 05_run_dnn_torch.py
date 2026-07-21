@@ -4,7 +4,11 @@ import torch
 import argparse
 
 from models import QuantileNetwork
-from data_utils import load_replication_data, standardize_train_forecast
+from data_utils import (
+    load_replication_data,
+    standardize_train_forecast,
+    standardize_target_train_forecast,
+)
 from train_utils import train_model, average_pinball_loss
 
 torch.manual_seed(123)
@@ -118,8 +122,16 @@ def build_forecast_cache(start_date, end_date):
 
     for i, date in enumerate(forecast_dates):
         X_train_raw = X.loc[:date].iloc[:-1]
-        y_train = y.loc[:date].iloc[:-1]
+        y_train_raw = y.loc[:date].iloc[:-1]
+        actual_raw = y.loc[date]
         X_forecast_raw = X.loc[[date]]
+
+        y_train_std, actual_std, y_mean, y_std = (
+            standardize_target_train_forecast(
+                y_train_raw,
+                actual_raw,
+            )
+        )
 
         X_train_std, X_forecast_std = standardize_train_forecast(
             X_train_raw,
@@ -133,7 +145,7 @@ def build_forecast_cache(start_date, end_date):
         )
 
         y_train_tensor = torch.tensor(
-            y_train.to_numpy(),
+            y_train_std.to_numpy(),
             dtype=torch.float32,
             device=device
         )
@@ -149,9 +161,12 @@ def build_forecast_cache(start_date, end_date):
             "X_train_tensor": X_train_tensor,
             "y_train_tensor": y_train_tensor,
             "X_forecast_tensor": X_forecast_tensor,
-            "y_train_series": y_train,
-            "actual": y.loc[date],
-            "n_features": X_train_tensor.shape[1]
+            "y_train_series": y_train_std,
+            "actual": actual_std,
+            "actual_raw": actual_raw,
+            "y_mean": y_mean,
+            "y_std": y_std,
+            "n_features": X_train_tensor.shape[1],
         })
 
         if i % 100 == 0:
@@ -207,16 +222,23 @@ def recursive_forecasts(
        
 
         with torch.no_grad():
-            forecast = model(X_forecast_tensor).item()
+            forecast_std = model(X_forecast_tensor).item()
+
+        forecast_raw = (
+            forecast_std * item["y_std"]
+            + item["y_mean"]
+        )
 
         rows.append({
             "date": date,
-            f"q{tau:.2f}": forecast,
+            f"q{tau:.2f}": forecast_std,
+            f"q{tau:.2f}_raw": forecast_raw,
             "actual": actual,
+            "actual_raw": item["actual_raw"],
             "lambda": lam,
             "nonlinear_layers": nonlinear_layers,
             "hidden_dim": hidden_dim,
-            "alpha": alpha
+            "alpha": alpha,
         })
 
         if i % 100 == 0:

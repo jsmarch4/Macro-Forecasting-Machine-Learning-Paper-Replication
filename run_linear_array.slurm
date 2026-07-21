@@ -33,5 +33,5 @@ echo "Node: $(hostname)"
 echo "Started: $(date)"
 
 python -u 04_run_linear_torch.py --quantile "$TAU"
-
 echo "Finished: $(date)"
+echo "Exit code: $?"

@@ -33,6 +33,8 @@ echo "Node: $(hostname)"
 echo "Started: $(date)"
 
 python -u 05_run_dnn_torch.py --quantile "$TAU"
-
 echo "Finished: $(date)"
+echo "Exit code: $?"
+
+
 
