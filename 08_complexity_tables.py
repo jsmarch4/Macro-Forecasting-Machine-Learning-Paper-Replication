@@ -66,6 +66,10 @@ import numpy as np
 import pandas as pd
 import torch
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from data_utils import (
     load_replication_data,
     standardize_train_forecast,
@@ -98,8 +102,9 @@ RESULTS_DIR = Path("results")
 OUTPUT_DIR = RESULTS_DIR / "complexity"
 FORECAST_DIR = OUTPUT_DIR / "forecasts"
 TABLE_DIR = OUTPUT_DIR / "tables"
+TABLE_FIGURE_DIR = OUTPUT_DIR / "table_figures"
 
-for directory in [OUTPUT_DIR, FORECAST_DIR, TABLE_DIR]:
+for directory in [OUTPUT_DIR, FORECAST_DIR, TABLE_DIR, TABLE_FIGURE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 VALIDATION_START = pd.Timestamp("1980-01-01")
@@ -1043,10 +1048,84 @@ def save_table_outputs(
 
 
 # ---------------------------------------------------------------------
+# Final table figures
+# ---------------------------------------------------------------------
+
+def clean_table_figure_directory() -> None:
+    """Remove old PNG/PDF table figures before saving the three final PNGs."""
+    for path in TABLE_FIGURE_DIR.iterdir():
+        if path.is_file() and path.suffix.lower() in {".png", ".pdf"}:
+            path.unlink()
+
+
+def display_table_frame(formatted: pd.DataFrame) -> pd.DataFrame:
+    columns = ["complexity"] + [f"{tau:.2f}" for tau in QUANTILES]
+    frame = formatted.loc[:, columns].copy()
+    return frame.rename(columns={"complexity": "r"})
+
+
+def draw_formatted_table(axis, formatted: pd.DataFrame, title: str) -> None:
+    frame = display_table_frame(formatted)
+    axis.axis("off")
+    axis.set_title(title, fontsize=13, fontweight="bold", pad=12)
+    table = axis.table(
+        cellText=frame.astype(str).values,
+        colLabels=frame.columns,
+        cellLoc="center",
+        colLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(7.5)
+    table.scale(1.0, 1.8)
+    for (row, _column), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(fontweight="bold")
+        cell.set_linewidth(0.6)
+
+
+def save_side_by_side_figure(linear_table, dnn_table, sample_name: str, filename: str) -> None:
+    figure, axes = plt.subplots(1, 2, figsize=(24, 10))
+    draw_formatted_table(axes[0], linear_table, f"{sample_name.title()} Sample — Linear Activation")
+    draw_formatted_table(axes[1], dnn_table, f"{sample_name.title()} Sample — DNN")
+    figure.tight_layout()
+    output_path = TABLE_FIGURE_DIR / filename
+    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved: {output_path}")
+
+
+def save_four_panel_figure(validation_linear, validation_dnn, test_linear, test_dnn) -> None:
+    figure, axes = plt.subplots(2, 2, figsize=(24, 18))
+    draw_formatted_table(axes[0, 0], validation_linear, "Validation Sample — Linear Activation")
+    draw_formatted_table(axes[0, 1], validation_dnn, "Validation Sample — DNN")
+    draw_formatted_table(axes[1, 0], test_linear, "Test Sample — Linear Activation")
+    draw_formatted_table(axes[1, 1], test_dnn, "Test Sample — DNN")
+    figure.tight_layout()
+    output_path = TABLE_FIGURE_DIR / "complexity_tables_linear_vs_dnn.png"
+    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved: {output_path}")
+
+
+def save_final_table_figures(tables: Dict[Tuple[str, str], pd.DataFrame]) -> None:
+    clean_table_figure_directory()
+    validation_linear = tables[("linear_activation", "validation")]
+    validation_dnn = tables[("dnn", "validation")]
+    test_linear = tables[("linear_activation", "test")]
+    test_dnn = tables[("dnn", "test")]
+    save_side_by_side_figure(validation_linear, validation_dnn, "validation", "table_2_validation_linear_vs_dnn.png")
+    save_side_by_side_figure(test_linear, test_dnn, "test", "table_3_test_linear_vs_dnn.png")
+    save_four_panel_figure(validation_linear, validation_dnn, test_linear, test_dnn)
+
+
+# ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
 
 def main() -> None:
+    formatted_tables: Dict[Tuple[str, str], pd.DataFrame] = {}
+
     print("\nBuilding validation cache...")
     validation_cache = build_forecast_cache(
         VALIDATION_START,
@@ -1136,6 +1215,12 @@ def main() -> None:
             test_detailed,
             test_formatted,
         )
+
+        formatted_tables[(family, "validation")] = validation_formatted
+        formatted_tables[(family, "test")] = test_formatted
+
+    print("\nSaving final table figures...")
+    save_final_table_figures(formatted_tables)
 
     print("\nComplexity mapping and tables complete.")
 
