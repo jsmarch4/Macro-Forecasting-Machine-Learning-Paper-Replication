@@ -103,8 +103,15 @@ OUTPUT_DIR = RESULTS_DIR / "complexity"
 FORECAST_DIR = OUTPUT_DIR / "forecasts"
 TABLE_DIR = OUTPUT_DIR / "tables"
 TABLE_FIGURE_DIR = OUTPUT_DIR / "table_figures"
+FORECAST_PLOT_DIR = OUTPUT_DIR / "forecast_plots"
 
-for directory in [OUTPUT_DIR, FORECAST_DIR, TABLE_DIR, TABLE_FIGURE_DIR]:
+for directory in [
+    OUTPUT_DIR,
+    FORECAST_DIR,
+    TABLE_DIR,
+    TABLE_FIGURE_DIR,
+    FORECAST_PLOT_DIR,
+]:
     directory.mkdir(parents=True, exist_ok=True)
 
 VALIDATION_START = pd.Timestamp("1980-01-01")
@@ -128,6 +135,21 @@ DISPLAY_SCALE = 100.0
 # The paper reports HAC standard errors but does not clearly specify bandwidth.
 # None uses the common automatic Newey-West lag rule.
 HAC_MAXLAGS = None
+
+# Forecast diagnostic plots use the representative model nearest this
+# target complexity. Change this single value to inspect another r.
+PLOT_TARGET_R = 0.5
+
+# NBER recession intervals relevant to the validation and test samples.
+# End dates are inclusive for monthly plotting purposes.
+NBER_RECESSIONS = [
+    (pd.Timestamp("1980-01-01"), pd.Timestamp("1980-07-01")),
+    (pd.Timestamp("1981-07-01"), pd.Timestamp("1982-11-01")),
+    (pd.Timestamp("1990-07-01"), pd.Timestamp("1991-03-01")),
+    (pd.Timestamp("2001-03-01"), pd.Timestamp("2001-11-01")),
+    (pd.Timestamp("2007-12-01"), pd.Timestamp("2009-06-01")),
+    (pd.Timestamp("2020-02-01"), pd.Timestamp("2020-04-01")),
+]
 
 FAMILIES = {
     "linear_activation": {
@@ -558,11 +580,25 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
     denominator = search["lambda_zero_fitted_variance"].to_numpy()
     numerator = search["initial_fitted_variance"].to_numpy()
 
-    search["achieved_r"] = np.where(
-        denominator > 0,
-        numerator / denominator,
-        0.0,
+    achieved_r = np.full(
+        shape=numerator.shape,
+        fill_value=np.nan,
+        dtype=float,
     )
+    np.divide(
+        numerator,
+        denominator,
+        out=achieved_r,
+        where=denominator > 0,
+    )
+    search["achieved_r"] = achieved_r
+
+    if search["achieved_r"].isna().any():
+        bad_rows = int(search["achieved_r"].isna().sum())
+        print(
+            f"Warning: {bad_rows} candidate(s) had zero lambda=0 "
+            "fitted variance and therefore undefined achieved_r."
+        )
 
     # The theoretical index lies in [0, 1]. Small overshoots can occur
     # because the neural-network fits are numerical rather than exact.
@@ -902,6 +938,35 @@ def build_complexity_table(
             "alpha": np.nan,
             "lambda": np.nan,
             "validation_loss": np.nan,
+            "forecast_variance": float(
+                np.var(
+                    naive_forecasts[f"q{tau:.2f}"].to_numpy(),
+                    ddof=0,
+                )
+            ),
+            "actual_variance": float(
+                np.var(
+                    naive_forecasts["actual"].to_numpy(),
+                    ddof=0,
+                )
+            ),
+            "forecast_to_actual_variance_ratio": (
+                float(
+                    np.var(
+                        naive_forecasts[f"q{tau:.2f}"].to_numpy(),
+                        ddof=0,
+                    )
+                    / np.var(
+                        naive_forecasts["actual"].to_numpy(),
+                        ddof=0,
+                    )
+                )
+                if np.var(
+                    naive_forecasts["actual"].to_numpy(),
+                    ddof=0,
+                ) > 0
+                else np.nan
+            ),
         })
 
     formatted_rows.append(benchmark_row)
@@ -993,6 +1058,35 @@ def build_complexity_table(
                 "validation_loss": float(
                     mapping_row["validation_loss"]
                 ),
+                "forecast_variance": float(
+                    np.var(
+                        aligned["model_forecast"].to_numpy(),
+                        ddof=0,
+                    )
+                ),
+                "actual_variance": float(
+                    np.var(
+                        aligned["actual"].to_numpy(),
+                        ddof=0,
+                    )
+                ),
+                "forecast_to_actual_variance_ratio": (
+                    float(
+                        np.var(
+                            aligned["model_forecast"].to_numpy(),
+                            ddof=0,
+                        )
+                        / np.var(
+                            aligned["actual"].to_numpy(),
+                            ddof=0,
+                        )
+                    )
+                    if np.var(
+                        aligned["actual"].to_numpy(),
+                        ddof=0,
+                    ) > 0
+                    else np.nan
+                ),
             })
 
         formatted_rows.append(formatted_row)
@@ -1045,6 +1139,163 @@ def save_table_outputs(
     print(f"{sample_name.upper()} TABLE: {family}")
     print("=" * 90)
     print(formatted.to_string(index=False))
+
+
+# ---------------------------------------------------------------------
+# Forecast diagnostic plots
+# ---------------------------------------------------------------------
+
+def shade_recessions(
+    axis: plt.Axes,
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> None:
+    """
+    Shade NBER recession months that overlap the displayed sample.
+    """
+    first_label = True
+
+    for recession_start, recession_end in NBER_RECESSIONS:
+        if recession_end < start_date or recession_start > end_date:
+            continue
+
+        axis.axvspan(
+            max(recession_start, start_date),
+            min(recession_end, end_date),
+            alpha=0.16,
+            label="NBER recession" if first_label else None,
+        )
+        first_label = False
+
+
+def assemble_quantile_forecast_frame(
+    family: str,
+    mapping: pd.DataFrame,
+    model_forecasts: Dict[Tuple, pd.DataFrame],
+    actual_source: pd.DataFrame,
+    target_r: float,
+) -> pd.DataFrame:
+    """
+    Assemble one actual series and the seven representative quantile
+    forecasts nearest the requested target complexity.
+    """
+    frame = actual_source[["actual"]].copy()
+
+    for tau in QUANTILES:
+        row = mapping[
+            np.isclose(mapping["tau"], tau)
+            & np.isclose(mapping["target_r"], target_r)
+        ]
+
+        if row.empty:
+            raise ValueError(
+                f"No mapping found for {family}, tau={tau:.2f}, "
+                f"target_r={target_r:.1f}."
+            )
+
+        spec = row_to_spec(row.iloc[0])
+        forecast_df = model_forecasts[spec.key]
+        frame = frame.join(
+            forecast_df[[f"q{tau:.2f}"]],
+            how="inner",
+        )
+
+    return frame
+
+
+def save_forecast_diagnostic_plot(
+    family: str,
+    sample_name: str,
+    mapping: pd.DataFrame,
+    model_forecasts: Dict[Tuple, pd.DataFrame],
+    actual_source: pd.DataFrame,
+    target_r: float = PLOT_TARGET_R,
+) -> None:
+    """
+    Plot actual unemployment changes and all seven quantile forecasts,
+    with recession periods shaded.
+    """
+    frame = assemble_quantile_forecast_frame(
+        family=family,
+        mapping=mapping,
+        model_forecasts=model_forecasts,
+        actual_source=actual_source,
+        target_r=target_r,
+    )
+
+    figure, axis = plt.subplots(figsize=(15, 7))
+
+    shade_recessions(
+        axis,
+        start_date=frame.index.min(),
+        end_date=frame.index.max(),
+    )
+
+    axis.plot(
+        frame.index,
+        frame["actual"],
+        linewidth=1.2,
+        label="Actual",
+    )
+
+    # Outer and inner forecast intervals.
+    axis.fill_between(
+        frame.index,
+        frame["q0.05"],
+        frame["q0.95"],
+        alpha=0.12,
+        label="5–95% forecast range",
+    )
+    axis.fill_between(
+        frame.index,
+        frame["q0.25"],
+        frame["q0.75"],
+        alpha=0.22,
+        label="25–75% forecast range",
+    )
+
+    axis.plot(
+        frame.index,
+        frame["q0.50"],
+        linewidth=1.2,
+        label="Median forecast",
+    )
+    axis.plot(
+        frame.index,
+        frame["q0.10"],
+        linewidth=0.8,
+        linestyle="--",
+        label="10th percentile",
+    )
+    axis.plot(
+        frame.index,
+        frame["q0.90"],
+        linewidth=0.8,
+        linestyle="--",
+        label="90th percentile",
+    )
+
+    axis.axhline(0.0, linewidth=0.7)
+    axis.set_title(
+        f"{sample_name.title()} Forecasts — "
+        f"{family.replace('_', ' ').title()} "
+        f"(target r={target_r:.1f})"
+    )
+    axis.set_xlabel("Date")
+    axis.set_ylabel("One-month-ahead unemployment-rate change")
+    axis.legend(loc="best", ncol=2)
+    axis.grid(alpha=0.2)
+
+    figure.tight_layout()
+
+    output_path = (
+        FORECAST_PLOT_DIR
+        / f"{sample_name}_{family}_r{target_r:.1f}.png"
+    )
+    figure.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(figure)
+    print(f"Saved: {output_path}")
+
 
 
 # ---------------------------------------------------------------------
@@ -1180,6 +1431,22 @@ def main() -> None:
             mapping=mapping,
             sample_name="test",
             cache=test_cache,
+        )
+
+        save_forecast_diagnostic_plot(
+            family=family,
+            sample_name="validation",
+            mapping=mapping,
+            model_forecasts=validation_forecasts,
+            actual_source=naive_validation,
+        )
+
+        save_forecast_diagnostic_plot(
+            family=family,
+            sample_name="test",
+            mapping=mapping,
+            model_forecasts=test_forecasts,
+            actual_source=naive_test,
         )
 
         validation_detailed, validation_formatted = (

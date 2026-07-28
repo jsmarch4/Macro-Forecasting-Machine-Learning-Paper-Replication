@@ -17,6 +17,10 @@ __pycache__/
 slurm_logs/
 slurm-*.out
 
+# Temporary / debugging
+debugging/
+results/debugging/
+
 # Generated outputs
 results/
 figures/
