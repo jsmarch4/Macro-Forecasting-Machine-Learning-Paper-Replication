@@ -122,7 +122,7 @@ TEST_END = None
 QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 TARGET_R_GRID = [round(value, 1) for value in np.arange(0.1, 1.01, 0.1)]
 
-THREE_LAMBDA_GRID = np.array([0.1, 1.0, 10.0], dtype=float)
+THREE_LAMBDA_GRID = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
 
 LEARNING_RATE = 0.001
 EPOCHS_INITIAL = 500
@@ -139,6 +139,10 @@ HAC_MAXLAGS = None
 # Forecast diagnostic plots use the representative model nearest this
 # target complexity. Change this single value to inspect another r.
 PLOT_TARGET_R = 0.5
+
+# A lambda=0 model below this fitted variance is effectively constant
+# and cannot provide a numerically meaningful complexity denominator.
+MIN_REFERENCE_VARIANCE = 1e-6
 
 # NBER recession intervals relevant to the validation and test samples.
 # End dates are inclusive for monthly plotting purposes.
@@ -577,32 +581,48 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
     search["initial_fitted_variance"] = candidate_variances
     search["lambda_zero_fitted_variance"] = reference_variances
 
-    denominator = search["lambda_zero_fitted_variance"].to_numpy()
-    numerator = search["initial_fitted_variance"].to_numpy()
+    denominator = search[
+        "lambda_zero_fitted_variance"
+    ].to_numpy(dtype=float)
+
+    numerator = search[
+        "initial_fitted_variance"
+    ].to_numpy(dtype=float)
+
+    # A complexity ratio is meaningful only when the unpenalized
+    # reference model has non-negligible fitted variation.
+    valid_reference = denominator >= MIN_REFERENCE_VARIANCE
 
     achieved_r = np.full(
         shape=numerator.shape,
         fill_value=np.nan,
         dtype=float,
     )
+
     np.divide(
         numerator,
         denominator,
         out=achieved_r,
-        where=denominator > 0,
+        where=valid_reference,
     )
-    search["achieved_r"] = achieved_r
 
-    if search["achieved_r"].isna().any():
-        bad_rows = int(search["achieved_r"].isna().sum())
+    # The paper defines complexity on [0, 1].
+    search["achieved_r"] = np.clip(
+        achieved_r,
+        0.0,
+        1.0,
+    )
+
+    search["valid_complexity_reference"] = valid_reference
+
+    invalid_count = int((~valid_reference).sum())
+
+    if invalid_count > 0:
         print(
-            f"Warning: {bad_rows} candidate(s) had zero lambda=0 "
-            "fitted variance and therefore undefined achieved_r."
+            f"Excluded {invalid_count} candidate(s) because their "
+            f"lambda=0 fitted variance was below "
+            f"{MIN_REFERENCE_VARIANCE:.1e}."
         )
-
-    # The theoretical index lies in [0, 1]. Small overshoots can occur
-    # because the neural-network fits are numerical rather than exact.
-    search["achieved_r"] = search["achieved_r"].clip(0.0, 1.0)
 
     output_path = (
         OUTPUT_DIR / f"{family}_complexity_candidates.csv"
@@ -625,11 +645,16 @@ def map_target_complexities(
     for tau in QUANTILES:
         tau_candidates = candidates[
             np.isclose(candidates["tau"], tau)
+            & candidates["valid_complexity_reference"]
+            & candidates["achieved_r"].notna()
         ].copy()
 
         if tau_candidates.empty:
             raise ValueError(
-                f"No candidates for {family}, tau={tau:.2f}."
+                f"No valid complexity candidates remain for "
+                f"family={family}, tau={tau:.2f}. "
+                f"All lambda=0 reference variances were below "
+                f"{MIN_REFERENCE_VARIANCE:.1e}."
             )
 
         for target_r in TARGET_R_GRID:

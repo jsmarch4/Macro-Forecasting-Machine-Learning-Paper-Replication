@@ -49,8 +49,8 @@ test_start = "2000-01-01"
 test_end = "2024-01-01"
 
 # Small grid for now. Paper-style full grid later:
-# lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
-lambda_grid = [0.1, 1.0, 10.0]
+lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
+# lambda_grid = [0.1, 1.0, 10.0]
 
 architecture_grid = [
     {"nonlinear_layers": 1, "hidden_dim": 2, "alpha": 0.0},

@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=12G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=slurm_logs/linear_%A_%a.out
 #SBATCH --error=slurm_logs/linear_%A_%a.err
 
