@@ -22,6 +22,16 @@ debugging/
 results/debugging/
 
 # Generated outputs
-results/
-figures/
-debugging/
+results/*
+figures/*
+
+# Keep these figure outputs
+!figures/dnn/
+!figures/dnn/figure4_full.png
+!figures/dnn/figure4_zoomed.png
+
+!results/complexity/
+!results/complexity/table_figures/
+!results/complexity/table_figures/complexity_tables_linear_vs_dnn.png
+!results/complexity/table_figures/table_2_validation_linear_vs_dnn.png
+!results/complexity/table_figures/table_3_test_linear_vs_dnn.png
