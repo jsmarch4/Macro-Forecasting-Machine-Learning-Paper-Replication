@@ -42,7 +42,7 @@ def average_pinball_loss(forecast_df, tau):
     losses = pinball_loss_numpy(
         forecast_df["actual"].to_numpy(),
         forecast_df[forecast_col].to_numpy(),
-        tau
+        tau,
     )
 
-    return losses.mean()
+    return float(losses.mean())

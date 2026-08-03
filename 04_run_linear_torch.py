@@ -1,7 +1,9 @@
+from pathlib import Path
+import argparse
+
 import numpy as np
 import pandas as pd
 import torch
-import argparse
 
 from models import QuantileNetwork
 from data_utils import (
@@ -11,22 +13,46 @@ from data_utils import (
 )
 from train_utils import train_model, average_pinball_loss
 
-torch.manual_seed(123)
-np.random.seed(123)
 
-# Tried to use Apple mps GPU and was slower
-device = torch.device("cpu")
+# ---------------------------------------------------------------------
+# Reproducibility and device
+# ---------------------------------------------------------------------
+
+SEED = 123
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+DEVICE = torch.device("cpu")
 
 
-# ------------------------------------------------------------
-# Load data
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Organized output directories
+# ---------------------------------------------------------------------
+
+RESULTS_DIR = Path("results")
+FAMILY_DIR = RESULTS_DIR / "linear_activation"
+
+SEARCH_DIR = FAMILY_DIR / "search"
+VALIDATION_FORECAST_DIR = FAMILY_DIR / "validation" / "forecasts"
+VALIDATION_RESULTS_DIR = FAMILY_DIR / "validation" / "results"
+TEST_FORECAST_DIR = FAMILY_DIR / "test" / "forecasts"
+TEST_SUMMARY_DIR = FAMILY_DIR / "test" / "summaries"
+
+for directory in [
+    SEARCH_DIR,
+    VALIDATION_FORECAST_DIR,
+    VALIDATION_RESULTS_DIR,
+    TEST_FORECAST_DIR,
+    TEST_SUMMARY_DIR,
+]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------
+# Data and experiment settings
+# ---------------------------------------------------------------------
 
 X, y = load_replication_data()
-
-# ------------------------------------------------------------
-# Experiment settings
-# ------------------------------------------------------------
 
 ALL_QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 
@@ -36,72 +62,63 @@ parser.add_argument(
     type=float,
     choices=ALL_QUANTILES,
     required=True,
-    help="Quantile to estimate."
+    help="Quantile to estimate.",
 )
 args = parser.parse_args()
 
-quantiles = [args.quantile]
+tau = float(args.quantile)
 
+VALIDATION_START = "1980-01-01"
+VALIDATION_END = "1999-12-01"
+TEST_START = "2000-01-01"
+TEST_END = "2024-01-01"
 
-validation_start = "1980-01-01"
-validation_end = "1999-12-01"
+# Paper-style 40-point log-spaced lambda grid.
+LAMBDA_GRID = np.exp(
+    np.linspace(np.log(0.2), np.log(10.0), 40)
+)
 
-test_start = "2000-01-01"
-test_end = "2024-01-01"
-
-# Small grid for now. Paper-style full grid later:
-lambda_grid = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
-# lambda_grid = [0.1, 1.0, 10.0]
-
-# Linear activation case: alpha = 1.0
-# nonlinear_layers = 0 means plain linear model.
-architecture_grid = [
+ARCHITECTURE_GRID = [
     {"nonlinear_layers": 0, "hidden_dim": 0, "alpha": 1.0},
-
     {"nonlinear_layers": 1, "hidden_dim": 2, "alpha": 1.0},
     {"nonlinear_layers": 1, "hidden_dim": 4, "alpha": 1.0},
     {"nonlinear_layers": 1, "hidden_dim": 8, "alpha": 1.0},
-
     {"nonlinear_layers": 2, "hidden_dim": 2, "alpha": 1.0},
     {"nonlinear_layers": 2, "hidden_dim": 4, "alpha": 1.0},
     {"nonlinear_layers": 2, "hidden_dim": 8, "alpha": 1.0},
 ]
 
+EPOCHS_INITIAL = 500
+EPOCHS_UPDATE = 100
+LEARNING_RATE = 0.001
 
-epochs_initial = 500
-epochs_update = 100
-learning_rate = 0.001
 
+# ---------------------------------------------------------------------
+# Model and forecast helpers
+# ---------------------------------------------------------------------
 
-# ------------------------------------------------------------
-# Recursive forecasting
-# ------------------------------------------------------------
-
-def initialize_model(model, y_train, tau):
-    """
-    Initialize network weights.
-
-    The paper does not specify exact initialization.
-    This uses small random weights and sets the final output bias
-    to the historical tau-quantile of the target.
-    """
+def initialize_model(
+    model: QuantileNetwork,
+    y_train: pd.Series,
+    tau_value: float,
+) -> None:
     with torch.no_grad():
-        for name, param in model.named_parameters():
+        for name, parameter in model.named_parameters():
             if "weight" in name:
-                param.normal_(mean=0.0, std=0.01)
+                parameter.normal_(mean=0.0, std=0.01)
             elif "bias" in name:
-                param.zero_()
+                parameter.zero_()
 
         final_layer = model.network[-1]
-        final_layer.bias.fill_(float(np.quantile(y_train.to_numpy(), tau)))
+        final_layer.bias.fill_(
+            float(np.quantile(y_train.to_numpy(), tau_value))
+        )
 
-def build_forecast_cache(start_date, end_date):
-    """
-    Precompute the standardized expanding-window datasets for each forecast date.
 
-    This avoids repeatedly standardizing and converting to tensors for every
-    architecture/lambda combination.
-    """
+def build_forecast_cache(
+    start_date: str,
+    end_date: str | None,
+) -> list[dict]:
     if end_date is None:
         forecast_dates = y.loc[start_date:].index
     else:
@@ -112,50 +129,44 @@ def build_forecast_cache(start_date, end_date):
     for i, date in enumerate(forecast_dates):
         X_train_raw = X.loc[:date].iloc[:-1]
         y_train_raw = y.loc[:date].iloc[:-1]
-        actual_raw = y.loc[date]
+        actual_raw = float(y.loc[date])
+        X_forecast_raw = X.loc[[date]]
 
         y_train_std, actual_std, y_mean, y_std = (
             standardize_target_train_forecast(
                 y_train_raw,
-                actual_raw
+                actual_raw,
             )
-        )   
-        X_forecast_raw = X.loc[[date]]
+        )
 
         X_train_std, X_forecast_std = standardize_train_forecast(
             X_train_raw,
-            X_forecast_raw
-        )
-
-        X_train_tensor = torch.tensor(
-            X_train_std.to_numpy(),
-            dtype=torch.float32,
-            device=device
-        )
-
-        y_train_tensor = torch.tensor(
-            y_train_std.to_numpy(),
-            dtype=torch.float32,
-            device=device
-        )
-
-        X_forecast_tensor = torch.tensor(
-            X_forecast_std.to_numpy(),
-            dtype=torch.float32,
-            device=device
+            X_forecast_raw,
         )
 
         cache.append({
             "date": date,
-            "X_train_tensor": X_train_tensor,
-            "y_train_tensor": y_train_tensor,
-            "X_forecast_tensor": X_forecast_tensor,
+            "X_train_tensor": torch.tensor(
+                X_train_std.to_numpy(),
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+            "y_train_tensor": torch.tensor(
+                y_train_std.to_numpy(),
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
+            "X_forecast_tensor": torch.tensor(
+                X_forecast_std.to_numpy(),
+                dtype=torch.float32,
+                device=DEVICE,
+            ),
             "y_train_series": y_train_std,
-            "actual": actual_std,
+            "actual": float(actual_std),
             "actual_raw": actual_raw,
-            "y_mean": y_mean,
-            "y_std": y_std,
-            "n_features": X_train_tensor.shape[1],
+            "y_mean": float(y_mean),
+            "y_std": float(y_std),
+            "n_features": X_train_std.shape[1],
         })
 
         if i % 100 == 0:
@@ -165,243 +176,257 @@ def build_forecast_cache(start_date, end_date):
 
 
 def recursive_forecasts(
-    forecast_cache,
-    lam,
-    tau,
-    nonlinear_layers,
-    hidden_dim,
-    alpha
-):
+    forecast_cache: list[dict],
+    lam: float,
+    tau_value: float,
+    nonlinear_layers: int,
+    hidden_dim: int,
+    alpha: float,
+    lr: float,
+) -> pd.DataFrame:
     rows = []
     model = None
 
     for i, item in enumerate(forecast_cache):
-        date = item["date"]
-        X_train_tensor = item["X_train_tensor"]
-        y_train_tensor = item["y_train_tensor"]
-        X_forecast_tensor = item["X_forecast_tensor"]
-        y_train_series = item["y_train_series"]
-        actual = item["actual"]
-        n_features = item["n_features"]
-
         if model is None:
             model = QuantileNetwork(
-                n_features=n_features,
+                n_features=item["n_features"],
                 nonlinear_layers=nonlinear_layers,
                 hidden_dim=hidden_dim,
-                alpha=alpha
+                alpha=alpha,
+            ).to(DEVICE)
+
+            initialize_model(
+                model,
+                item["y_train_series"],
+                tau_value,
             )
-            model = model.to(device)
-
-            initialize_model(model, y_train_series, tau)
-
-            epochs = epochs_initial
+            epochs = EPOCHS_INITIAL
         else:
-            epochs = epochs_update
+            epochs = EPOCHS_UPDATE
 
         model = train_model(
             model=model,
-            X_train_tensor=X_train_tensor,
-            y_train_tensor=y_train_tensor,
-            tau=tau,
-            lam=lam,
+            X_train_tensor=item["X_train_tensor"],
+            y_train_tensor=item["y_train_tensor"],
+            tau=tau_value,
+            lam=float(lam),
             epochs=epochs,
-            lr=learning_rate
+            lr=lr,
         )
 
         with torch.no_grad():
-            forecast_std = model(X_forecast_tensor).item()
-
-            forecast_raw = (
-                forecast_std * item["y_std"]
-                + item["y_mean"]
+            forecast_std = float(
+                model(item["X_forecast_tensor"]).item()
             )
 
+        forecast_raw = (
+            forecast_std * item["y_std"]
+            + item["y_mean"]
+        )
+
         rows.append({
-            "date": date,
-            f"q{tau:.2f}": forecast_std,
-            f"q{tau:.2f}_raw": forecast_raw,
-            "actual": actual,
+            "date": item["date"],
+            f"q{tau_value:.2f}": forecast_std,
+            f"q{tau_value:.2f}_raw": forecast_raw,
+            "actual": item["actual"],
             "actual_raw": item["actual_raw"],
-            "lambda": lam,
+            "lambda": float(lam),
             "nonlinear_layers": nonlinear_layers,
             "hidden_dim": hidden_dim,
-            "alpha": alpha
+            "alpha": alpha,
         })
 
         if i % 100 == 0:
-            print(f"  Forecast {i}/{len(forecast_cache)}")       
-
+            print(f"  Forecast {i}/{len(forecast_cache)}")
 
     return pd.DataFrame(rows).set_index("date")
 
 
-# ------------------------------------------------------------
-# Validation and test loop
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# Main search for one array quantile
+# ---------------------------------------------------------------------
 
 print("\nBuilding validation cache...")
 validation_cache = build_forecast_cache(
-    validation_start,
-    validation_end
+    VALIDATION_START,
+    VALIDATION_END,
 )
 
 print("\nBuilding test cache...")
 test_cache = build_forecast_cache(
-    test_start,
-    test_end
+    TEST_START,
+    TEST_END,
 )
 
+validation_results = []
+best_validation_loss = float("inf")
+best_validation_forecasts = None
 
-all_test_results = []
-all_validation_results = []
+total_models = len(ARCHITECTURE_GRID) * len(LAMBDA_GRID)
+model_number = 0
 
-for tau in quantiles:
-    print("\n" + "=" * 80)
-    print(f"Running linear-activation network search for tau={tau}")
-    print("=" * 80)
+print("\n" + "=" * 80)
+print(f"Running linear-activation search for tau={tau:.2f}")
+print(f"Lambda candidates: {len(LAMBDA_GRID)}")
+print("=" * 80)
 
-    validation_results = []
-    best_validation_loss = float("inf")
-    best_validation_forecasts = None
+for architecture in ARCHITECTURE_GRID:
+    nonlinear_layers = architecture["nonlinear_layers"]
+    hidden_dim = architecture["hidden_dim"]
+    alpha = architecture["alpha"]
 
-    total_models = len(architecture_grid) * len(lambda_grid)
-    model_number = 0
+    for lam in LAMBDA_GRID:
+        model_number += 1
 
-    for arch in architecture_grid:
-        nonlinear_layers = arch["nonlinear_layers"]
-        hidden_dim = arch["hidden_dim"]
-        alpha = arch["alpha"]
+        print(
+            f"\nModel {model_number}/{total_models}: "
+            f"tau={tau:.2f} | "
+            f"layers={nonlinear_layers} | "
+            f"dim={hidden_dim} | "
+            f"alpha={alpha} | "
+            f"lambda={lam:.12g}"
+        )
 
-        for lam in lambda_grid:
-            model_number += 1
+        validation_forecasts = recursive_forecasts(
+            forecast_cache=validation_cache,
+            lam=float(lam),
+            tau_value=tau,
+            nonlinear_layers=nonlinear_layers,
+            hidden_dim=hidden_dim,
+            alpha=alpha,
+            lr=LEARNING_RATE,
+        )
 
+        validation_loss = average_pinball_loss(
+            validation_forecasts,
+            tau,
+        )
+
+        if not np.isfinite(validation_loss):
+            retry_learning_rate = 0.0001
             print(
-                f"\nModel {model_number}/{total_models}: "
-                f"tau={tau} | "
-                f"layers={nonlinear_layers} | "
-                f"dim={hidden_dim} | "
-                f"alpha={alpha} | "
+                "Non-finite validation loss; retrying candidate with "
+                f"learning rate {retry_learning_rate}."
+            )
+
+            validation_forecasts = recursive_forecasts(
+                forecast_cache=validation_cache,
+                lam=float(lam),
+                tau_value=tau,
+                nonlinear_layers=nonlinear_layers,
+                hidden_dim=hidden_dim,
+                alpha=alpha,
+                lr=retry_learning_rate,
+            )
+
+            validation_loss = average_pinball_loss(
+                validation_forecasts,
+                tau,
+            )
+
+        if not np.isfinite(validation_loss):
+            raise RuntimeError(
+                "Non-finite validation loss after retry for "
+                f"tau={tau:.2f}, "
+                f"layers={nonlinear_layers}, "
+                f"hidden_dim={hidden_dim}, "
+                f"alpha={alpha}, "
                 f"lambda={lam}"
             )
 
-            val_forecasts = recursive_forecasts(
-                forecast_cache=validation_cache,
-                lam=lam,
-                tau=tau,
-                nonlinear_layers=nonlinear_layers,
-                hidden_dim=hidden_dim,
-                alpha=alpha
-            )
-            
+        result = {
+            "model_family": "linear_activation",
+            "tau": tau,
+            "nonlinear_layers": nonlinear_layers,
+            "hidden_dim": hidden_dim,
+            "alpha": alpha,
+            "lambda": float(lam),
+            "validation_loss": float(validation_loss),
+        }
+        validation_results.append(result)
 
-            val_loss = average_pinball_loss(val_forecasts, tau)
+        if validation_loss < best_validation_loss:
+            best_validation_loss = float(validation_loss)
+            best_validation_forecasts = validation_forecasts.copy()
 
-            validation_results.append({
-                "model_family": "linear_activation",
-                "tau": tau,
-                "nonlinear_layers": nonlinear_layers,
-                "hidden_dim": hidden_dim,
-                "alpha": alpha,
-                "lambda": lam,
-                "validation_loss": val_loss
-            })
+validation_results_df = pd.DataFrame(validation_results)
 
-            if val_loss < best_validation_loss:
-                best_validation_loss = val_loss
-                best_validation_forecasts = val_forecasts.copy()
-
-
-    validation_results_df = pd.DataFrame(validation_results)
-    all_validation_results.extend(validation_results)
-
-    validation_results_df.to_csv(
-        f"results/linear_activation_q{tau:.2f}_validation_results.csv",
-        index=False
-    )
-
-    best_row = validation_results_df.loc[
-        validation_results_df["validation_loss"].idxmin()
-    ]
-
-    best_nonlinear_layers = int(best_row["nonlinear_layers"])
-    best_hidden_dim = int(best_row["hidden_dim"])
-    best_alpha = float(best_row["alpha"])
-    best_lambda = float(best_row["lambda"])
-
-    if best_validation_forecasts is None:
-        raise RuntimeError(
-            f"No validation forecasts were stored for tau={tau}."
-        )
-
-    best_validation_forecasts.to_csv(
-        f"results/linear_activation_q{tau:.2f}_validation_forecasts.csv"
-    )
-
-    print(
-        f"\nBest validation model:"
-        f"\n  layers = {best_nonlinear_layers}"
-        f"\n  hidden dimension = {best_hidden_dim}"
-        f"\n  alpha = {best_alpha}"
-        f"\n  lambda = {best_lambda}"
-        f"\n  validation loss = {best_row['validation_loss']:.6f}"
-    )
-
-    print("\nRunning out-of-sample test...")
-
-    test_forecasts = recursive_forecasts(
-        forecast_cache=test_cache,
-        lam=best_lambda,
-        tau=tau,
-        nonlinear_layers=best_nonlinear_layers,
-        hidden_dim=best_hidden_dim,
-        alpha=best_alpha
-    )
-
-    test_loss = average_pinball_loss(test_forecasts, tau)
-    print(f"Test pinball loss = {test_loss:.6f}")
-
-    test_forecasts.to_csv(
-        f"results/linear_activation_q{tau:.2f}_test_forecasts.csv"
-    )
-
-    all_test_results.append({
-        "tau": tau,
-        "best_nonlinear_layers": best_nonlinear_layers,
-        "best_hidden_dim": best_hidden_dim,
-        "best_alpha": best_alpha,
-        "best_lambda": best_lambda,
-        "test_loss": test_loss
-    })
-
-
-
-all_test_results_df = pd.DataFrame(all_test_results)
-
-tau = args.quantile
-
-all_test_results_df.to_csv(
-    f"results/linear_activation_q{tau:.2f}_test_summary.csv",
-    index=False
+# Full architecture × 40-lambda grid for this quantile.
+validation_results_df.to_csv(
+    VALIDATION_RESULTS_DIR / f"q{tau:.2f}.csv",
+    index=False,
+)
+validation_results_df.to_csv(
+    SEARCH_DIR / f"q{tau:.2f}_search.csv",
+    index=False,
 )
 
-all_validation_results_df = pd.DataFrame(all_validation_results)
+best_row = validation_results_df.loc[
+    validation_results_df["validation_loss"].idxmin()
+]
 
-all_validation_results_df.to_csv(
-    f"results/linear_activation_q{tau:.2f}_search_summary.csv",
-    index=False
+best_nonlinear_layers = int(best_row["nonlinear_layers"])
+best_hidden_dim = int(best_row["hidden_dim"])
+best_alpha = float(best_row["alpha"])
+best_lambda = float(best_row["lambda"])
+
+if best_validation_forecasts is None:
+    raise RuntimeError(
+        f"No validation forecasts were stored for tau={tau:.2f}."
+    )
+
+best_validation_forecasts.to_csv(
+    VALIDATION_FORECAST_DIR / f"q{tau:.2f}.csv"
 )
 
-
-
-
-
-print("\nFinal Results")
-print("-" * 60)
 print(
-    all_test_results_df[
-        ["tau", "best_nonlinear_layers",
-         "best_hidden_dim", "best_lambda",
-         "test_loss"]
-    ]
+    "\nBest validation model:"
+    f"\n  layers = {best_nonlinear_layers}"
+    f"\n  hidden dimension = {best_hidden_dim}"
+    f"\n  alpha = {best_alpha}"
+    f"\n  lambda = {best_lambda}"
+    f"\n  validation loss = {best_validation_loss:.6f}"
 )
+
+print("\nRunning out-of-sample test...")
+
+test_forecasts = recursive_forecasts(
+    forecast_cache=test_cache,
+    lam=best_lambda,
+    tau_value=tau,
+    nonlinear_layers=best_nonlinear_layers,
+    hidden_dim=best_hidden_dim,
+    alpha=best_alpha,
+    lr=LEARNING_RATE,
+)
+
+test_loss = float(average_pinball_loss(test_forecasts, tau))
+
+if not np.isfinite(test_loss):
+    raise RuntimeError(
+        f"Non-finite test loss for tau={tau:.2f}."
+    )
+
+test_forecasts.to_csv(
+    TEST_FORECAST_DIR / f"q{tau:.2f}.csv"
+)
+
+test_summary = pd.DataFrame([{
+    "tau": tau,
+    "best_nonlinear_layers": best_nonlinear_layers,
+    "best_hidden_dim": best_hidden_dim,
+    "best_alpha": best_alpha,
+    "best_lambda": best_lambda,
+    "validation_loss": best_validation_loss,
+    "test_loss": test_loss,
+}])
+
+test_summary.to_csv(
+    TEST_SUMMARY_DIR / f"q{tau:.2f}.csv",
+    index=False,
+)
+
+print("\nFinal result")
+print("-" * 60)
+print(test_summary.to_string(index=False))

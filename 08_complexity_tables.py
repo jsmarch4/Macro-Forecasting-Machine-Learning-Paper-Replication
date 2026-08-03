@@ -6,8 +6,8 @@ tables for BOTH:
     1. linear-activation networks
     2. deep neural networks
 
-The candidate grid remains:
-    lambda in {0.1, 1.0, 10.0}
+The candidate grid uses all 40 positive lambda values produced by scripts 04 and 05.
+This script never collapses the search back to a three-lambda subset.
 
 The complexity reference is computed separately at lambda = 0:
 
@@ -35,11 +35,17 @@ The r = 0 row is the recursive unconditional-quantile benchmark.
 
 Outputs
 -------
-results/complexity/
-    linear_activation_complexity_candidates.csv
-    linear_activation_complexity_mapping.csv
-    dnn_complexity_candidates.csv
-    dnn_complexity_mapping.csv
+results/complexity/candidates/
+    linear_activation.csv
+    dnn.csv
+
+results/complexity/mappings/
+    linear_activation.csv
+    dnn.csv
+
+results/complexity/benchmark/
+    naive_validation_forecasts.csv
+    naive_test_forecasts.csv
 
 results/complexity/forecasts/{validation,test}/
     forecast files for selected representative candidates
@@ -100,6 +106,9 @@ DEVICE = torch.device("cpu")
 
 RESULTS_DIR = Path("results")
 OUTPUT_DIR = RESULTS_DIR / "complexity"
+CANDIDATE_DIR = OUTPUT_DIR / "candidates"
+MAPPING_DIR = OUTPUT_DIR / "mappings"
+BENCHMARK_DIR = OUTPUT_DIR / "benchmark"
 FORECAST_DIR = OUTPUT_DIR / "forecasts"
 TABLE_DIR = OUTPUT_DIR / "tables"
 TABLE_FIGURE_DIR = OUTPUT_DIR / "table_figures"
@@ -107,6 +116,9 @@ FORECAST_PLOT_DIR = OUTPUT_DIR / "forecast_plots"
 
 for directory in [
     OUTPUT_DIR,
+    CANDIDATE_DIR,
+    MAPPING_DIR,
+    BENCHMARK_DIR,
     FORECAST_DIR,
     TABLE_DIR,
     TABLE_FIGURE_DIR,
@@ -117,16 +129,25 @@ for directory in [
 VALIDATION_START = pd.Timestamp("1980-01-01")
 VALIDATION_END = pd.Timestamp("1999-12-01")
 TEST_START = pd.Timestamp("2000-01-01")
-TEST_END = None
+TEST_END = pd.Timestamp("2024-01-01")
 
 QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 TARGET_R_GRID = [round(value, 1) for value in np.arange(0.1, 1.01, 0.1)]
 
-THREE_LAMBDA_GRID = np.exp(np.linspace(np.log(0.2), np.log(10), 40))
+LAMBDA_GRID = np.exp(np.linspace(np.log(0.2), np.log(10.0), 40))
 
 LEARNING_RATE = 0.001
-EPOCHS_INITIAL = 500
-EPOCHS_UPDATE = 100
+
+TRAINING_SETTINGS = {
+    "linear_activation": {
+        "epochs_initial": 500,
+        "epochs_update": 100,
+    },
+    "dnn": {
+        "epochs_initial": 750,
+        "epochs_update": 150,
+    },
+}
 
 # The paper normalizes loss by tau * (1 - tau).
 # Multiplying by 100 produces readable paper-style numbers.
@@ -157,11 +178,10 @@ NBER_RECESSIONS = [
 
 FAMILIES = {
     "linear_activation": {
-        "search_file": RESULTS_DIR
-        / "linear_activation_hyperparameter_search_results.csv",
+        "search_dir": RESULTS_DIR / "linear_activation" / "search",
     },
     "dnn": {
-        "search_file": RESULTS_DIR / "dnn_hyperparameter_search_results.csv",
+        "search_dir": RESULTS_DIR / "dnn" / "search",
     },
 }
 
@@ -316,9 +336,9 @@ def recursive_forecasts(
                 y_train=item["y_train_series"],
                 tau=spec.tau,
             )
-            epochs = EPOCHS_INITIAL
+            epochs = TRAINING_SETTINGS[spec.family]["epochs_initial"]
         else:
-            epochs = EPOCHS_UPDATE
+            epochs = TRAINING_SETTINGS[spec.family]["epochs_update"]
 
         model = train_model(
             model=model,
@@ -430,7 +450,7 @@ def fitted_variance_for_candidate(spec: ModelSpec) -> float:
         y_train_tensor=y_tensor,
         tau=spec.tau,
         lam=spec.lam,
-        epochs=EPOCHS_INITIAL,
+        epochs=TRAINING_SETTINGS[spec.family]["epochs_initial"],
         lr=LEARNING_RATE,
     )
 
@@ -440,73 +460,123 @@ def fitted_variance_for_candidate(spec: ModelSpec) -> float:
     return float(np.var(fitted, ddof=0))
 
 
-def read_three_lambda_search(family: str) -> pd.DataFrame:
+def read_full_lambda_search(family: str) -> pd.DataFrame:
     """
-    Read the stored hyperparameter-search results and retain only
-    lambda in {0.1, 1, 10}.
-    """
-    path = FAMILIES[family]["search_file"]
+    Read and combine all seven per-quantile search files created by 04/05.
 
-    if not path.exists():
+    Each file must contain the complete architecture x 40-lambda grid.
+    No three-lambda subset is used anywhere in this script.
+    """
+    search_dir = FAMILIES[family]["search_dir"]
+
+    if not search_dir.exists():
         raise FileNotFoundError(
-            f"Missing hyperparameter search file: {path}"
+            f"Missing search directory: {search_dir}"
         )
 
-    df = pd.read_csv(path)
+    frames = []
 
-    required = {
-        "tau",
-        "nonlinear_layers",
-        "hidden_dim",
-        "alpha",
-        "lambda",
-        "validation_loss",
-    }
-    missing = required.difference(df.columns)
+    for tau in QUANTILES:
+        path = search_dir / f"q{tau:.2f}_search.csv"
 
-    if missing:
-        raise ValueError(
-            f"{path} is missing columns: {sorted(missing)}"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Missing hyperparameter-search file: {path}"
+            )
+
+        frame = pd.read_csv(path)
+
+        required = {
+            "tau",
+            "nonlinear_layers",
+            "hidden_dim",
+            "alpha",
+            "lambda",
+            "validation_loss",
+        }
+        missing = required.difference(frame.columns)
+
+        if missing:
+            raise ValueError(
+                f"{path} is missing columns: {sorted(missing)}"
+            )
+
+        frame = frame.copy()
+        for column in ["tau", "lambda", "validation_loss"]:
+            frame[column] = pd.to_numeric(
+                frame[column], errors="coerce"
+            )
+
+        frame = frame.dropna(
+            subset=["tau", "lambda", "validation_loss"]
+        )
+        frame = frame[
+            np.isclose(frame["tau"].to_numpy(dtype=float), tau)
+        ].copy()
+
+        if frame.empty:
+            raise ValueError(
+                f"{path} contains no usable rows for tau={tau:.2f}."
+            )
+
+        lambda_values = frame["lambda"].to_numpy(dtype=float)
+        on_grid = np.isclose(
+            lambda_values[:, None],
+            np.asarray(LAMBDA_GRID, dtype=float)[None, :],
+            rtol=1e-8,
+            atol=1e-12,
+        ).any(axis=1)
+        frame = frame.loc[on_grid].copy()
+
+        unique_lambdas = np.sort(frame["lambda"].unique())
+        if len(unique_lambdas) != len(LAMBDA_GRID):
+            raise ValueError(
+                f"{path} contains {len(unique_lambdas)} distinct "
+                f"lambda values from the required grid; expected "
+                f"{len(LAMBDA_GRID)}. Rerun scripts 04/05 with the "
+                "full 40-lambda grid before running 08."
+            )
+
+        duplicate_keys = [
+            "tau",
+            "nonlinear_layers",
+            "hidden_dim",
+            "alpha",
+            "lambda",
+        ]
+        frame = (
+            frame.sort_values("validation_loss")
+            .drop_duplicates(subset=duplicate_keys, keep="first")
+            .reset_index(drop=True)
         )
 
-    lambda_mask = np.zeros(len(df), dtype=bool)
+        frames.append(frame)
 
-    for lam in THREE_LAMBDA_GRID:
-        lambda_mask |= np.isclose(
-            df["lambda"].to_numpy(dtype=float),
-            lam,
-            rtol=0,
-            atol=1e-10,
-        )
-
-    df = df.loc[lambda_mask].copy()
-    df = df[df["tau"].isin(QUANTILES)].copy()
-
-    if df.empty:
-        raise ValueError(
-            f"No three-grid lambda rows found in {path}."
-        )
-
-    # Remove accidental duplicate rows from repeated runs.
-    df = (
-        df.sort_values("validation_loss")
-        .drop_duplicates(
-            subset=[
-                "tau",
-                "nonlinear_layers",
-                "hidden_dim",
-                "alpha",
-                "lambda",
-            ],
-            keep="first",
-        )
-        .reset_index(drop=True)
-    )
-
+    df = pd.concat(frames, ignore_index=True)
     df["family"] = family
 
-    return df
+    expected_architectures = 7 if family == "linear_activation" else 18
+    expected_rows = (
+        len(QUANTILES)
+        * expected_architectures
+        * len(LAMBDA_GRID)
+    )
 
+    if len(df) != expected_rows:
+        raise ValueError(
+            f"Combined {family} search contains {len(df)} unique rows; "
+            f"expected {expected_rows} = {len(QUANTILES)} quantiles x "
+            f"{expected_architectures} architectures x "
+            f"{len(LAMBDA_GRID)} lambdas."
+        )
+
+    print(
+        f"Loaded {len(df)} {family} candidates from {search_dir}: "
+        f"{len(QUANTILES)} quantiles, {expected_architectures} "
+        f"architectures, and {len(LAMBDA_GRID)} lambdas."
+    )
+
+    return df
 
 def build_complexity_candidates(family: str) -> pd.DataFrame:
     """
@@ -516,7 +586,7 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
     Lambda = 0 is used only as the complexity reference. It is not added
     to the validation-selection grid.
     """
-    search = read_three_lambda_search(family)
+    search = read_full_lambda_search(family)
     candidate_variances = []
     reference_variances = []
 
@@ -625,7 +695,7 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
         )
 
     output_path = (
-        OUTPUT_DIR / f"{family}_complexity_candidates.csv"
+        CANDIDATE_DIR / f"{family}.csv"
     )
     search.to_csv(output_path, index=False)
     print(f"Saved: {output_path}")
@@ -701,7 +771,7 @@ def map_target_complexities(
 
     mapping = pd.DataFrame(rows)
 
-    output_path = OUTPUT_DIR / f"{family}_complexity_mapping.csv"
+    output_path = MAPPING_DIR / f"{family}.csv"
     mapping.to_csv(output_path, index=False)
     print(f"Saved: {output_path}")
 
@@ -1427,10 +1497,10 @@ def main() -> None:
     )
 
     naive_validation.to_csv(
-        OUTPUT_DIR / "naive_validation_forecasts.csv"
+        BENCHMARK_DIR / "naive_validation_forecasts.csv"
     )
     naive_test.to_csv(
-        OUTPUT_DIR / "naive_test_forecasts.csv"
+        BENCHMARK_DIR / "naive_test_forecasts.csv"
     )
 
     for family in FAMILIES:
