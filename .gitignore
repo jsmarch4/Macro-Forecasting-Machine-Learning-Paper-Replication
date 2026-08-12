@@ -25,13 +25,17 @@ results/debugging/
 results/*
 figures/*
 
-# Keep these figure outputs
-!figures/dnn/
-!figures/dnn/figure4_full.png
-!figures/dnn/figure4_zoomed.png
+# Ignore everything under complexity by default
+results/complexity/**
 
+# Keep only the published complexity figures
 !results/complexity/
 !results/complexity/table_figures/
 !results/complexity/table_figures/table_2_validation_linear_vs_dnn.png
 !results/complexity/table_figures/table_3_test_linear_vs_dnn.png
 !results/complexity/table_figures/complexity_tables_linear_vs_dnn_four_panel.png
+
+# Keep Figure 4
+!figures/dnn/
+!figures/dnn/figure4_full.png
+!figures/dnn/figure4_zoomed.png
