@@ -141,7 +141,7 @@ TARGET_R_GRID = [round(value, 1) for value in np.arange(0.1, 1.01, 0.1)]
 
 LAMBDA_GRID = np.exp(np.linspace(np.log(0.2), np.log(10.0), 40))
 
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 
 TRAINING_SETTINGS = {
     "linear_activation": {
