@@ -32,6 +32,6 @@ figures/*
 
 !results/complexity/
 !results/complexity/table_figures/
-!results/complexity/table_figures/complexity_tables_linear_vs_dnn.png
 !results/complexity/table_figures/table_2_validation_linear_vs_dnn.png
 !results/complexity/table_figures/table_3_test_linear_vs_dnn.png
+!results/complexity/table_figures/complexity_tables_linear_vs_dnn_four_panel.png

@@ -9,15 +9,20 @@ tables for BOTH:
 The candidate grid uses all 40 positive lambda values produced by scripts 04 and 05.
 This script never collapses the search back to a three-lambda subset.
 
-The complexity reference is computed separately at lambda = 0:
+The complexity reference is computed from lambda = 0 fits:
 
     r(candidate)
         = fitted_variance(candidate)
-          / fitted_variance(same architecture, lambda=0)
+          / max_lambda0_fitted_variance(family, tau)
+
+For each model family and quantile, the denominator is the MAXIMUM fitted
+variance across all architectures when lambda = 0. This matches the paper's
+Var_0^max normalization and makes complexity comparable across architectures.
 
 Fitted variance is computed from fitted values on the fixed initial
-pre-validation sample (all observations before 1980-01). Lambda = 0 is not
-added to the validation-selection grid.
+pre-validation sample (all observations before 1980-01). Lambda = 0 is used
+only to construct the complexity denominator and is not added to the
+validation-selection grid.
 
 Thus:
     r approximately 0 -> almost-flat fitted quantile
@@ -161,8 +166,8 @@ HAC_MAXLAGS = None
 # target complexity. Change this single value to inspect another r.
 PLOT_TARGET_R = 0.5
 
-# A lambda=0 model below this fitted variance is effectively constant
-# and cannot provide a numerically meaningful complexity denominator.
+# If the family/quantile-wide maximum lambda=0 fitted variance is below this
+# threshold, the complexity denominator is not numerically meaningful.
 MIN_REFERENCE_VARIANCE = 1e-6
 
 # NBER recession intervals relevant to the validation and test samples.
@@ -580,21 +585,34 @@ def read_full_lambda_search(family: str) -> pd.DataFrame:
 
 def build_complexity_candidates(family: str) -> pd.DataFrame:
     """
-    Compute each candidate's fitted variance and normalize it by the
-    fitted variance of the same architecture at lambda = 0.
+    Compute each candidate's fitted variance and normalize it using the
+    paper-style maximum unpenalized fitted variance.
 
-    Lambda = 0 is used only as the complexity reference. It is not added
-    to the validation-selection grid.
+    For each family and quantile tau:
+
+        Var_0^max(tau, family)
+            = max over architectures of
+              Var(fitted values | lambda = 0)
+
+    Every positive-lambda candidate at that same family/tau then uses:
+
+        achieved_r
+            = candidate fitted variance / Var_0^max(tau, family)
+
+    Lambda = 0 is used only to construct the complexity denominator. It is
+    not added to the validation-selection grid.
     """
     search = read_full_lambda_search(family)
-    candidate_variances = []
-    reference_variances = []
 
-    # Avoid fitting the same lambda=0 reference once for every penalized lambda.
+    candidate_variances = []
+
+    # Cache one lambda=0 fitted variance per architecture and quantile.
     zero_variance_cache: dict[tuple, float] = {}
 
     total = len(search)
 
+    # Step 1: compute every positive-lambda fitted variance and compute
+    # each architecture's lambda=0 fitted variance exactly once.
     for index, row in search.iterrows():
         spec = ModelSpec(
             family=family,
@@ -636,6 +654,7 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
 
             print(
                 "  Computing lambda=0 reference for "
+                f"tau={spec.tau:.2f}, "
                 f"layers={spec.nonlinear_layers}, "
                 f"dim={spec.hidden_dim}, alpha={spec.alpha}"
             )
@@ -644,23 +663,71 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
                 fitted_variance_for_candidate(zero_spec)
             )
 
-        reference_variances.append(
+    search["initial_fitted_variance"] = candidate_variances
+
+    # Keep each architecture's own lambda=0 variance only as a diagnostic.
+    architecture_zero_variances = []
+
+    for _, row in search.iterrows():
+        architecture_key = (
+            family,
+            round(float(row["tau"]), 8),
+            int(row["nonlinear_layers"]),
+            int(row["hidden_dim"]),
+            round(float(row["alpha"]), 8),
+        )
+
+        architecture_zero_variances.append(
             zero_variance_cache[architecture_key]
         )
 
-    search["initial_fitted_variance"] = candidate_variances
-    search["lambda_zero_fitted_variance"] = reference_variances
+    search["architecture_lambda_zero_fitted_variance"] = (
+        architecture_zero_variances
+    )
 
-    denominator = search[
-        "lambda_zero_fitted_variance"
-    ].to_numpy(dtype=float)
+    # Step 2: paper-style denominator.
+    # All architectures at the same family/tau share the SAME Var_0^max.
+    max_zero_variance_by_tau = {}
+
+    for tau in QUANTILES:
+        tau_zero_variances = [
+            variance
+            for key, variance in zero_variance_cache.items()
+            if np.isclose(key[1], tau)
+        ]
+
+        if not tau_zero_variances:
+            raise ValueError(
+                f"No lambda=0 reference variances found for "
+                f"family={family}, tau={tau:.2f}."
+            )
+
+        max_zero_variance = float(np.max(tau_zero_variances))
+        max_zero_variance_by_tau[round(tau, 8)] = max_zero_variance
+
+        print(
+            f"Var_0^max for {family}, tau={tau:.2f}: "
+            f"{max_zero_variance:.10f}"
+        )
+
+    search["max_lambda_zero_fitted_variance"] = (
+        search["tau"]
+        .map(
+            lambda tau: max_zero_variance_by_tau[
+                round(float(tau), 8)
+            ]
+        )
+        .astype(float)
+    )
 
     numerator = search[
         "initial_fitted_variance"
     ].to_numpy(dtype=float)
 
-    # A complexity ratio is meaningful only when the unpenalized
-    # reference model has non-negligible fitted variation.
+    denominator = search[
+        "max_lambda_zero_fitted_variance"
+    ].to_numpy(dtype=float)
+
     valid_reference = denominator >= MIN_REFERENCE_VARIANCE
 
     achieved_r = np.full(
@@ -688,15 +755,20 @@ def build_complexity_candidates(family: str) -> pd.DataFrame:
     invalid_count = int((~valid_reference).sum())
 
     if invalid_count > 0:
-        print(
-            f"Excluded {invalid_count} candidate(s) because their "
-            f"lambda=0 fitted variance was below "
-            f"{MIN_REFERENCE_VARIANCE:.1e}."
+        invalid_taus = sorted(
+            search.loc[
+                ~valid_reference,
+                "tau",
+            ].unique()
         )
 
-    output_path = (
-        CANDIDATE_DIR / f"{family}.csv"
-    )
+        raise ValueError(
+            f"{family} has an invalid Var_0^max denominator below "
+            f"{MIN_REFERENCE_VARIANCE:.1e} for tau value(s): "
+            f"{invalid_taus}"
+        )
+
+    output_path = CANDIDATE_DIR / f"{family}.csv"
     search.to_csv(output_path, index=False)
     print(f"Saved: {output_path}")
 
@@ -723,7 +795,7 @@ def map_target_complexities(
             raise ValueError(
                 f"No valid complexity candidates remain for "
                 f"family={family}, tau={tau:.2f}. "
-                f"All lambda=0 reference variances were below "
+                f"The family/quantile Var_0^max denominator was below "
                 f"{MIN_REFERENCE_VARIANCE:.1e}."
             )
 
@@ -761,8 +833,15 @@ def map_target_complexities(
                 "initial_fitted_variance": float(
                     chosen["initial_fitted_variance"]
                 ),
-                "lambda_zero_fitted_variance": float(
-                    chosen["lambda_zero_fitted_variance"]
+                "architecture_lambda_zero_fitted_variance": float(
+                    chosen[
+                        "architecture_lambda_zero_fitted_variance"
+                    ]
+                ),
+                "max_lambda_zero_fitted_variance": float(
+                    chosen[
+                        "max_lambda_zero_fitted_variance"
+                    ]
                 ),
                 "validation_loss": float(
                     chosen["validation_loss"]
