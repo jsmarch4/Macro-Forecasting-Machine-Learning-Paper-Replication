@@ -145,11 +145,11 @@ LEARNING_RATE = 0.0001
 
 TRAINING_SETTINGS = {
     "linear_activation": {
-        "epochs_initial": 500,
+        "epochs_initial": 1500,
         "epochs_update": 100,
     },
     "dnn": {
-        "epochs_initial": 750,
+        "epochs_initial": 1500,
         "epochs_update": 150,
     },
 }
