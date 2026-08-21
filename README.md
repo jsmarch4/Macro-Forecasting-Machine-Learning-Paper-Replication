@@ -2,22 +2,30 @@
 
 This repository contains an independent Python replication of the forecasting framework developed in *Macroeconomic Forecasting and Machine Learning* by Domenico Giannone and coauthors.
 
-The objective of this project is to reproduce the paper's recursive forecasting pipeline as faithfully as possible using Python and PyTorch. The implementation follows the methodology described in the paper while documenting implementation details that were omitted from the original publication.
+The project reproduces the paper's recursive quantile forecasting methodology using Python and PyTorch, including the complete recursive forecasting pipeline, model selection procedure, and empirical evaluation described in the paper.
 
-Current features include:
+---
 
-- FRED-MD preprocessing using the official transformation codes
-- Construction of the one-month-ahead unemployment rate change forecasting target
+## Features
+
+- FRED-MD data preprocessing using the official transformation codes
+- One-month-ahead unemployment rate change forecasting target
 - Official FRED-MD outlier detection and removal
-- Recursive expanding-window estimation
-- Recursive standardization using only information available at each forecast origin
+- Recursive expanding-window forecasting
+- Recursive predictor and target standardization using only information available at each forecast origin
 - Historical unconditional quantile benchmark
-- Linearized neural network quantile regression (Leaky ReLU with α = 1)
+- Linear quantile regression with L2 regularization
 - Deep neural network quantile regression
-- Validation-based hyperparameter selection over network architecture, activation function, and L2 regularization
-- Recursive warm-start training
-- Pinball loss evaluation on validation and test samples
-- Figure 4 style density forecast visualization with prediction intervals
+- Validation-based hyperparameter selection over:
+  - network architecture
+  - hidden layer width
+  - Leaky ReLU activation parameter
+  - L2 regularization strength
+- Recursive warm-start optimization
+- Pinball loss evaluation on validation and holdout test samples
+- Complexity-index model selection
+- Figure 4 replication with predictive interval visualization
+- Complexity-performance tables for validation and test samples
 
 ---
 
@@ -33,68 +41,98 @@ Run the scripts in the following order:
 05_run_dnn_torch.py
 06_summarize_results.py
 07_plot_figure4_bands.py
+08_complexity_tables.py
+09_complexity_table_figures.py
 ```
 
 ---
 
-## Current Implementation
+## Data
 
-### Data
+The replication uses the monthly FRED-MD macroeconomic database and follows the transformation and preprocessing procedures described in the original paper.
 
-- Monthly FRED-MD predictor set
-- Official FRED-MD transformations
-- One-month-ahead unemployment rate change target
+- Official FRED-MD transformation codes
+- Official FRED-MD outlier removal procedure
+- One-month-ahead unemployment rate change forecasting target
 
-### Forecasting
+---
 
-- Recursive expanding-window estimation
-- Recursive predictor standardization
-- Warm-start optimization
+## Forecasting Framework
 
-### Model Selection
+The forecasting procedure follows a recursive expanding-window design.
 
-Validation period:
+For each forecast origin:
 
-```
+1. Standardize predictors and the response using only historical information.
+2. Train the model using all data available at that date.
+3. Produce one-step-ahead quantile forecasts.
+4. Expand the training sample and repeat.
+
+Forecasts are evaluated using the pinball loss over both validation and holdout test samples.
+
+---
+
+## Model Selection
+
+Hyperparameters are selected exclusively using the validation sample.
+
+Validation period
+
+```text
 1980–1999
 ```
 
-Test period:
+Test period
 
-```
+```text
 2000–2024
 ```
 
-Hyperparameters are selected exclusively on the validation sample before evaluation on the holdout test sample.
-
-Current search includes
+The search considers:
 
 - network depth
-- hidden dimension
+- hidden layer width
 - Leaky ReLU activation parameter
 - L2 regularization parameter
+- model complexity index
+
+The selected model is then evaluated on the holdout test sample without further tuning.
 
 ---
 
-## Current Status
+## Repository Structure
 
-The recursive forecasting pipeline is fully operational.
+```text
+01_dataset_construction.py      Build replication dataset
+02_benchmark_quantiles.py       Historical quantile benchmark
+03_pinball_loss.py              Benchmark pinball loss
+04_run_linear_torch.py          Linear quantile model
+05_run_dnn_torch.py             Deep neural network model
+06_summarize_results.py         Aggregate forecasting results
+07_plot_figure4_bands.py        Figure 4 replication
+08_complexity_tables.py         Complexity-index model selection
+09_complexity_table_figures.py  Complexity table visualization
 
-Current empirical findings are consistent with one of the paper's main conclusions:
-
-- the regularized linear activation network performs similarly to the nonlinear deep neural network.
-
-However, the current implementation does not yet match the published forecasting improvements over the unconditional benchmark. Remaining work focuses on reproducing undocumented optimization details (e.g., learning-rate selection, initialization, and optimization settings) and implementing additional diagnostics and benchmark models discussed in the referee reports.
+data_utils.py
+models.py
+train_utils.py
+losses.py
+```
 
 ---
 
-## Future Work
+## Requirements
 
-- Full 40-value regularization grid
-- Complexity-index replication
-- Additional benchmark models
-- Quantile crossing diagnostics
-- Empirical coverage evaluation
-- Calibration analysis
-- Forecast interval diagnostics
-- Additional macroeconomic targets and forecast horizons
+- Python 3.11
+- PyTorch
+- NumPy
+- pandas
+- matplotlib
+
+---
+
+## Reference
+
+Giannone, D., Lenza, M., Primiceri, G., and coauthors.
+
+*Macroeconomic Forecasting and Machine Learning.*
