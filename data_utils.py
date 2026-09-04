@@ -2,18 +2,12 @@ import pandas as pd
 
 
 def load_replication_data(path="data/replication_dataset.csv"):
-    data = pd.read_csv(path, index_col=0, parse_dates=True)
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
 
     target = "y_unrate_change_1m_ahead"
 
-    drop_columns = [
-        target,
-        "TOTRESNS",
-        "NONBORRES",
-    ]
-
-    X = data.drop(columns=drop_columns, errors="ignore")
-    y = data[target]
+    X = df.drop(columns=[target])
+    y = df[target]
 
     return X, y
 

@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 
+
 # ------------------------------------------------------------
 # Load raw FRED-MD file
 # ------------------------------------------------------------
@@ -13,118 +14,155 @@ transform_row = raw[raw["sasdate"] == "Transform:"].iloc[0]
 # Drop transformation row
 df = raw[raw["sasdate"] != "Transform:"].copy()
 
-# Dates
+# Parse dates
 df["sasdate"] = pd.to_datetime(df["sasdate"])
 df = df.set_index("sasdate")
 
-# Convert data to numeric
+# Convert all series to numeric
 df = df.apply(pd.to_numeric, errors="coerce")
 
 
 # ------------------------------------------------------------
-# FRED-MD transformation function
-# Mirrors prepare_missing.m / transxf()
+# FRED-MD transformations
+# Matches prepare_missing() / transxf() in
+# Domenico's py_generate_freddataDG.py
 # ------------------------------------------------------------
 
 def fred_transform(x, tcode):
     """
-    Apply FRED-MD transformation code to one pandas Series.
-    Codes follow the FRED-MD appendix and MATLAB prepare_missing.m.
+    Apply the FRED-MD transformation used in the original
+    forecasting-data generation code.
     """
 
     x = x.astype(float)
-    small = 1e-6
+    n = len(x)
+
+    # Initialize transformed series as missing
+    y = pd.Series(
+        np.full(n, np.nan),
+        index=x.index,
+        dtype=float,
+    )
 
     if pd.isna(tcode):
-        return x * np.nan
+        return y
 
     tcode = int(tcode)
+    small = 1e-6
 
+    # 1 => Level
     if tcode == 1:
-        # Level: x_t
-        return x
+        y = x.copy()
 
+    # 2 => First difference
     elif tcode == 2:
-        # First difference: x_t - x_{t-1}
-        return x.diff()
+        y = x.diff()
 
+    # 3 => Second difference
     elif tcode == 3:
-        # Second difference
-        return x.diff().diff()
+        y = x.diff().diff()
 
+    # 4 => Natural log
     elif tcode == 4:
-        # Natural log
-        if x.min(skipna=True) < small:
-            return x * np.nan
-        return np.log(x)
+        if x.min(skipna=True) > small:
+            y = np.log(x)
 
+    # 5 => First difference of natural log
     elif tcode == 5:
-        # First difference of natural log
-        if x.min(skipna=True) <= small:
-            return x * np.nan
-        return np.log(x).diff()
+        if x.min(skipna=True) > small:
+            y = np.log(x).diff()
 
+    # 6 => Second difference of natural log
     elif tcode == 6:
-        # Second difference of natural log
-        if x.min(skipna=True) <= small:
-            return x * np.nan
-        return np.log(x).diff().diff()
+        if x.min(skipna=True) > small:
+            y = np.log(x).diff().diff()
 
+    # 7 => First difference of percent change
     elif tcode == 7:
-        # First difference of percent change
         pct_change = (x - x.shift(1)) / x.shift(1)
-        return pct_change.diff()
+        y = pct_change.diff()
 
     else:
-        raise ValueError(f"Unknown transformation code: {tcode}")
+        raise ValueError(
+            f"Unknown transformation code: {tcode}"
+        )
 
-def remove_outliers_fred_md(X):
-    """
-    Official FRED-MD style outlier removal:
-    replace x with NaN if |x - median| > 10 * IQR.
-    """
-    X_clean = X.copy()
+    return y
 
-    for col in X_clean.columns:
-        series = X_clean[col]
-
-        median = series.median(skipna=True)
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-
-        if pd.isna(iqr):
-            continue
-
-        outlier_mask = (series - median).abs() > 10 * iqr
-        X_clean.loc[outlier_mask, col] = np.nan
-
-    return X_clean
 
 # ------------------------------------------------------------
-# Apply transformations to predictors
+# Apply transformations
 # ------------------------------------------------------------
 
-X_transformed = pd.DataFrame(index=df.index)
+# Build all transformed columns together rather than inserting
+# one at a time. This avoids pandas DataFrame fragmentation.
+transformed_columns = {
+    col: fred_transform(df[col], transform_row[col])
+    for col in df.columns
+}
 
-for col in df.columns:
-    tcode = transform_row[col]
-    X_transformed[col] = fred_transform(df[col], tcode)
+X_transformed = pd.DataFrame(
+    transformed_columns,
+    index=df.index,
+)
 
 
-# MATLAB code removes first two months after transformations
+# ------------------------------------------------------------
+# Remove first two observations
+# ------------------------------------------------------------
+
+# Some transformations require two lags. The original code
+# removes the first two months after transformation.
 X_transformed = X_transformed.iloc[2:].copy()
 df = df.iloc[2:].copy()
-X_transformed = remove_outliers_fred_md(X_transformed)
+
 
 # ------------------------------------------------------------
-# Construct target variable from raw UNRATE level
+# Remove predictors excluded by original forecasting code
+# ------------------------------------------------------------
+
+# Variables excluded because their histories are unbalanced.
+unbalanced_predictors = [
+    "ACOGNO",
+    "ANDENOx",
+    "TWEXAFEGSMTHx",
+    "UMCSENTx",
+    "VIXCLSx",
+]
+
+# Reserve variables explicitly removed in the original code.
+reserve_predictors = [
+    "NONBORRES",
+    "TOTRESNS",
+]
+
+excluded_predictors = (
+    unbalanced_predictors
+    + reserve_predictors
+)
+
+X_transformed = X_transformed.drop(
+    columns=[
+        col
+        for col in excluded_predictors
+        if col in X_transformed.columns
+    ]
+)
+
+
+# ------------------------------------------------------------
+# Construct unemployment target
 # ------------------------------------------------------------
 
 target = "y_unrate_change_1m_ahead"
 
-# Forecast change in unemployment rate one month ahead:
-# UNRATE_{t+1} - UNRATE_t
+# UNRATE has transformation code 2 in FRED-MD.
+# For a one-month horizon, the original code therefore uses
+# the next month's first difference in UNRATE:
+#
+#     UNRATE_{t+1} - UNRATE_t
+#
+# This is constructed directly from the raw UNRATE level here.
 y = df["UNRATE"].shift(-1) - df["UNRATE"]
 
 
@@ -135,21 +173,95 @@ y = df["UNRATE"].shift(-1) - df["UNRATE"]
 replication_data = X_transformed.copy()
 replication_data[target] = y
 
-# Drop rows where target is missing
-replication_data = replication_data.dropna(subset=[target])
 
-# Fill missing predictor values
-predictor_cols = replication_data.columns.drop(target)
-replication_data[predictor_cols] = (
-    replication_data[predictor_cols]
-    .ffill()
-    .bfill()
+# ------------------------------------------------------------
+# Match usable sample start
+# ------------------------------------------------------------
+
+# The original forecasting-data generation code begins the
+# usable sample in 1960.
+replication_data = replication_data.loc[
+    "1960-01-01":
+].copy()
+
+
+# ------------------------------------------------------------
+# Handle remaining missing observations
+# Matches code_for_paper/format_data.py
+# ------------------------------------------------------------
+
+# Original code first treats positive/negative infinity as missing.
+replication_data = replication_data.replace(
+    [np.inf, -np.inf],
+    np.nan,
 )
 
-# Save
-replication_data.to_csv("data/replication_dataset.csv")
 
-print("Dataset construction complete.")
-print(f"Replication dataset shape: {replication_data.shape}")
-print(f"Date range: {replication_data.index.min()} to {replication_data.index.max()}")
-print("Saved data/replication_dataset.csv")
+# Diagnostic: report what will be removed.
+missing_by_variable = replication_data.isna().sum()
+missing_by_variable = missing_by_variable[
+    missing_by_variable > 0
+]
+
+rows_with_missing = replication_data.isna().any(axis=1)
+
+print("\nMissing values before dropping incomplete rows:")
+print(missing_by_variable)
+
+print(
+    "Total missing values:",
+    int(missing_by_variable.sum()),
+)
+
+print(
+    "Rows containing at least one missing value:",
+    int(rows_with_missing.sum()),
+)
+
+print("\nDates dropped because of missing values:")
+print(
+    replication_data.index[
+        rows_with_missing
+    ]
+)
+
+
+# The original format_data.py uses rs.dropna().
+# No forward filling or backward filling is performed.
+replication_data = replication_data.dropna().copy()
+
+
+# ------------------------------------------------------------
+# Save
+# ------------------------------------------------------------
+
+replication_data.to_csv(
+    "data/replication_dataset.csv"
+)
+
+
+# ------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------
+
+print("\nDataset construction complete.")
+
+print(
+    f"Replication dataset shape: "
+    f"{replication_data.shape}"
+)
+
+print(
+    f"Date range: "
+    f"{replication_data.index.min()} "
+    f"to {replication_data.index.max()}"
+)
+
+print(
+    "Remaining missing values:",
+    int(replication_data.isna().sum().sum()),
+)
+
+print(
+    "Saved data/replication_dataset.csv"
+)

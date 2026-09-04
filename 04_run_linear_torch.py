@@ -90,7 +90,7 @@ ARCHITECTURE_GRID = [
 
 EPOCHS_INITIAL = 500
 EPOCHS_UPDATE = 100
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0001
 
 
 # ---------------------------------------------------------------------
