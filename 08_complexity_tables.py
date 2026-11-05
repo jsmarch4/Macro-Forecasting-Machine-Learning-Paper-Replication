@@ -1,1591 +1,354 @@
-"""
-08_complexity_tables.py
+"""Complexity mapping following Domenico's train_script.py/test_script.py.
 
-Build preliminary complexity-index mappings and paper-style validation/test
-tables for BOTH:
-    1. linear-activation networks
-    2. deep neural networks
+For each family and quantile, fit ALL available architecture x 41-lambda
+candidates on the validation period; measure variance of the final
+validation-trained model's in-sample predictions; sort by lambda and
+select the nearest fitted variance to r times the first lambda=0 variance.
+The first reference is recorded explicitly (the original code's tie rule
+among lambda=0 architectures is filesystem-order dependent).
 
-The candidate grid uses all 40 positive lambda values produced by scripts 04 and 05.
-This script never collapses the search back to a three-lambda subset.
-
-The complexity reference is computed separately at lambda = 0:
-
-    r(candidate)
-        = fitted_variance(candidate)
-          / fitted_variance(same architecture, lambda=0)
-
-Fitted variance is computed from fitted values on the fixed initial
-pre-validation sample (all observations before 1980-01). Lambda = 0 is not
-added to the validation-selection grid.
-
-Thus:
-    r approximately 0 -> almost-flat fitted quantile
-    r = 1             -> most variable candidate in that family/quantile grid
-
-For every target r in {0.1, ..., 1.0}, the script selects the candidate with
-the closest achieved r. Ties are broken by:
-    1. lower validation loss
-    2. smaller lambda
-    3. fewer layers
-    4. smaller hidden dimension
-    5. smaller alpha
-
-The r = 0 row is the recursive unconditional-quantile benchmark.
-
-Outputs
--------
-results/complexity/candidates/
-    linear_activation.csv
-    dnn.csv
-
-results/complexity/mappings/
-    linear_activation.csv
-    dnn.csv
-
-results/complexity/benchmark/
-    naive_validation_forecasts.csv
-    naive_test_forecasts.csv
-
-results/complexity/forecasts/{validation,test}/
-    forecast files for selected representative candidates
-
-results/complexity/tables/
-    table_validation_linear_activation_detailed.csv
-    table_validation_linear_activation_formatted.csv
-    table_test_linear_activation_detailed.csv
-    table_test_linear_activation_formatted.csv
-    table_validation_dnn_detailed.csv
-    table_validation_dnn_formatted.csv
-    table_test_dnn_detailed.csv
-    table_test_dnn_formatted.csv
+The 04/05 validation searches supply architecture lists only; they do not
+preselect the architecture. Cached results and verified complexity tables
+are not overwritten: outputs go to results/complexity_cross_architecture.
 """
 
-from __future__ import annotations
-
-from dataclasses import dataclass
 from pathlib import Path
+import argparse
+import hashlib
+import json
 import math
-from typing import Dict, Iterable, Tuple
-
 import numpy as np
 import pandas as pd
 import torch
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
-from data_utils import (
-    load_replication_data,
-    standardize_train_forecast,
-    standardize_target_train_forecast,
-)
-from losses import pinball_loss_numpy
+from data_utils import load_replication_data, standardize_train_forecast, standardize_target_train_forecast
 from models import QuantileNetwork
-from train_utils import train_model
+from losses import pinball_loss_numpy
 
-
-# ---------------------------------------------------------------------
-# Reproducibility and runtime
-# ---------------------------------------------------------------------
-
-SEED = 123
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-
-# These tiny networks are often faster with one CPU thread.
+ROOT = Path('results/complexity')
+TAUS = (.05, .10, .25, .50, .75, .90, .95)
+FAMILIES = ('linear_activation', 'dnn')
+R_GRID = np.round(np.arange(.1, 1.01, .1), 1)
+START_VAL, END_VAL = '1980-02-01', '2000-01-01'
+START_TEST, END_TEST = '2000-02-01', '2019-12-01'
+SEED, LR, EPOCHS_FIRST, EPOCHS_NEXT = 123, .001, 500, 100
+CACHE_VERSION = 'domenico_grid41_all_arch_v1'
+DEVICE = torch.device('cpu')
 torch.set_num_threads(1)
 
-DEVICE = torch.device("cpu")
+
+def directory(*parts):
+    p = ROOT.joinpath(*parts)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-# ---------------------------------------------------------------------
-# Main configuration
-# ---------------------------------------------------------------------
-
-RESULTS_DIR = Path("results")
-OUTPUT_DIR = RESULTS_DIR / "complexity"
-CANDIDATE_DIR = OUTPUT_DIR / "candidates"
-MAPPING_DIR = OUTPUT_DIR / "mappings"
-BENCHMARK_DIR = OUTPUT_DIR / "benchmark"
-FORECAST_DIR = OUTPUT_DIR / "forecasts"
-TABLE_DIR = OUTPUT_DIR / "tables"
-TABLE_FIGURE_DIR = OUTPUT_DIR / "table_figures"
-FORECAST_PLOT_DIR = OUTPUT_DIR / "forecast_plots"
-
-for directory in [
-    OUTPUT_DIR,
-    CANDIDATE_DIR,
-    MAPPING_DIR,
-    BENCHMARK_DIR,
-    FORECAST_DIR,
-    TABLE_DIR,
-    TABLE_FIGURE_DIR,
-    FORECAST_PLOT_DIR,
-]:
-    directory.mkdir(parents=True, exist_ok=True)
-
-VALIDATION_START = pd.Timestamp("1980-01-01")
-VALIDATION_END = pd.Timestamp("1999-12-01")
-TEST_START = pd.Timestamp("2000-01-01")
-TEST_END = pd.Timestamp("2019-12-01")
-
-QUANTILES = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
-TARGET_R_GRID = [round(value, 1) for value in np.arange(0.1, 1.01, 0.1)]
-
-LAMBDA_GRID = np.exp(np.linspace(np.log(0.2), np.log(10.0), 40))
-
-LEARNING_RATE = 0.001
-
-TRAINING_SETTINGS = {
-    "linear_activation": {
-        "epochs_initial": 500,
-        "epochs_update": 100,
-    },
-    "dnn": {
-        "epochs_initial": 750,
-        "epochs_update": 150,
-    },
-}
-
-# The paper normalizes loss by tau * (1 - tau).
-# Multiplying by 100 produces readable paper-style numbers.
-DISPLAY_SCALE = 100.0
-
-# The paper reports HAC standard errors but does not clearly specify bandwidth.
-# None uses the common automatic Newey-West lag rule.
-HAC_MAXLAGS = None
-
-# Forecast diagnostic plots use the representative model nearest this
-# target complexity. Change this single value to inspect another r.
-PLOT_TARGET_R = 0.5
-
-# A lambda=0 model below this fitted variance is effectively constant
-# and cannot provide a numerically meaningful complexity denominator.
-MIN_REFERENCE_VARIANCE = 1e-6
-
-# NBER recession intervals relevant to the validation and test samples.
-# End dates are inclusive for monthly plotting purposes.
-NBER_RECESSIONS = [
-    (pd.Timestamp("1980-01-01"), pd.Timestamp("1980-07-01")),
-    (pd.Timestamp("1981-07-01"), pd.Timestamp("1982-11-01")),
-    (pd.Timestamp("1990-07-01"), pd.Timestamp("1991-03-01")),
-    (pd.Timestamp("2001-03-01"), pd.Timestamp("2001-11-01")),
-    (pd.Timestamp("2007-12-01"), pd.Timestamp("2009-06-01")),
-    (pd.Timestamp("2020-02-01"), pd.Timestamp("2020-04-01")),
-]
-
-FAMILIES = {
-    "linear_activation": {
-        "search_dir": RESULTS_DIR / "linear_activation" / "search",
-    },
-    "dnn": {
-        "search_dir": RESULTS_DIR / "dnn" / "search",
-    },
-}
+def spec_id(spec):
+    raw = json.dumps(spec, sort_keys=True, default=lambda x: x.item() if hasattr(x, "item") else str(x))
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------
+def search_architectures():
+    """Enumerate ALL saved 04/05 architectures for each family and quantile.
 
-X, y = load_replication_data()
-
-
-@dataclass(frozen=True)
-class ModelSpec:
-    family: str
-    tau: float
-    nonlinear_layers: int
-    hidden_dim: int
-    alpha: float
-    lam: float
-
-    @property
-    def key(self) -> Tuple:
-        return (
-            self.family,
-            round(self.tau, 8),
-            self.nonlinear_layers,
-            self.hidden_dim,
-            round(self.alpha, 8),
-            round(self.lam, 12),
-        )
-
-
-# ---------------------------------------------------------------------
-# Shared model helpers
-# ---------------------------------------------------------------------
-
-def initialize_model(
-    model: QuantileNetwork,
-    y_train: pd.Series,
-    tau: float,
-) -> None:
+    Validation losses are retained for auditing, not used to preselect an
+    architecture. The input row order is retained to define a reproducible
+    first-candidate reference at lambda=0 (see build_map).
     """
-    Match the current project initialization:
-      - all weights ~ Normal(0, 0.01)
-      - all biases = 0
-      - final bias = historical tau-quantile
-    """
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if "weight" in name:
-                parameter.normal_(mean=0.0, std=0.01)
-            elif "bias" in name:
-                parameter.zero_()
+    architectures = []
+    for family in FAMILIES:
+        for tau in TAUS:
+            path = Path('results') / family / 'search' / f'q{tau:.2f}_search.csv'
+            if not path.exists():
+                raise FileNotFoundError(f'Missing validation search: {path}')
+            df = pd.read_csv(path)
+            needed = {'nonlinear_layers', 'hidden_dim', 'alpha', 'lambda', 'validation_loss'}
+            if not needed.issubset(df.columns):
+                raise ValueError(f'{path}: missing {needed - set(df.columns)}')
+            df = df.dropna(subset=['validation_loss'])
+            if df.empty:
+                raise ValueError(f'No valid search rows: {path}')
+            for (layers, dim, alpha), group in df.groupby(
+                ['nonlinear_layers', 'hidden_dim', 'alpha'], sort=False
+            ):
+                # Original train_script.py: linear has 0 layers; DNN has 1 or 2.
+                if family == 'linear_activation' and int(layers) != 0:
+                    continue
+                if family == 'dnn' and int(layers) not in (1, 2):
+                    continue
+                best = group.loc[group.validation_loss.idxmin()]
+                architectures.append(dict(
+                    family=family, tau=float(tau),
+                    nonlinear_layers=int(layers), hidden_dim=int(dim),
+                    alpha=float(alpha),
+                    best_validation_lambda=float(best['lambda']),
+                    best_validation_loss=float(best.validation_loss),
+                ))
+    result = pd.DataFrame(architectures)
+    result.to_csv(directory('mappings') / 'available_architectures.csv', index=False)
+    print(f'Enumerated {len(result)} family/quantile/architecture combinations', flush=True)
+    return result
 
-        final_layer = model.network[-1]
-        final_layer.bias.fill_(
-            float(np.quantile(y_train.to_numpy(), tau))
-        )
 
-
-def make_model(spec: ModelSpec, n_features: int) -> QuantileNetwork:
-    model = QuantileNetwork(
-        n_features=n_features,
-        nonlinear_layers=spec.nonlinear_layers,
-        hidden_dim=spec.hidden_dim,
-        alpha=spec.alpha,
-    ).to(DEVICE)
-    return model
-
-
-def build_forecast_cache(
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp | None,
-) -> list[dict]:
-    """
-    Precompute expanding-window standardized tensors.
-    """
-    if end_date is None:
-        dates = y.loc[start_date:].index
-    else:
-        dates = y.loc[start_date:end_date].index
-
+def prepare_cache(X, y, first, last):
+    """Construct expanding-window tensors once, not once per candidate."""
     cache = []
-
-    for i, date in enumerate(dates):
-        X_train_raw = X.loc[:date].iloc[:-1]
-        y_train_raw = y.loc[:date].iloc[:-1]
-        actual_raw = float(y.loc[date])
-        X_forecast_raw = X.loc[[date]]
-
-        y_train_std, actual_std, y_mean, y_std = (
-            standardize_target_train_forecast(
-                y_train_raw,
-                actual_raw,
-            )
-        )
-
-        X_train_std, X_forecast_std = standardize_train_forecast(
-            X_train_raw,
-            X_forecast_raw,
-        )
-
-        cache.append({
-            "date": date,
-            "X_train_tensor": torch.tensor(
-                X_train_std.to_numpy(),
-                dtype=torch.float32,
-                device=DEVICE,
-            ),
-            "y_train_tensor": torch.tensor(
-                y_train_std.to_numpy(),
-                dtype=torch.float32,
-                device=DEVICE,
-            ),
-            "X_forecast_tensor": torch.tensor(
-                X_forecast_std.to_numpy(),
-                dtype=torch.float32,
-                device=DEVICE,
-            ),
-            "y_train_series": y_train_std,
-            "actual_std": float(actual_std),
-            "actual_raw": actual_raw,
-            "y_mean": float(y_mean),
-            "y_std": float(y_std),
-            "n_features": X_train_std.shape[1],
-        })
-
-        if i % 100 == 0:
-            print(f"  Cache {i}/{len(dates)}")
-
+    for date in y.loc[first:last].index:
+        history_x = X.loc[:date].iloc[:-1]
+        history_y = y.loc[:date].iloc[:-1]
+        xs, xf = standardize_train_forecast(history_x, X.loc[[date]])
+        ys, _, mean_y, _ = standardize_target_train_forecast(history_y, float(y.loc[date]))
+        cache.append((date, torch.as_tensor(xs.to_numpy(), dtype=torch.float32),
+                      torch.as_tensor(ys.to_numpy(), dtype=torch.float32),
+                      torch.as_tensor(xf.to_numpy(), dtype=torch.float32),
+                      float(mean_y), float(y.loc[date])))
     return cache
 
 
-def recursive_forecasts(
-    cache: list[dict],
-    spec: ModelSpec,
-) -> pd.DataFrame:
-    """
-    Recursive expanding-window forecasts with warm-started model weights.
-    """
-    np.random.seed(SEED)
+def make_model(spec, n_features):
     torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    return QuantileNetwork(n_features, int(spec['nonlinear_layers']),
+                           int(spec['hidden_dim']), float(spec['alpha'])).to(DEVICE)
 
-    model = None
+
+def train_model(model, xt, yt, tau, lam, epochs, lr, optimizer=None):
+    """fred.py objective: mean pinball loss + lambda * squared weights."""
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    for _ in range(epochs):
+        optimizer.zero_grad()
+        pred = model(xt).reshape(-1)
+        if pred.shape != yt.shape:
+            raise ValueError(f'Prediction/target shape mismatch: {pred.shape} vs {yt.shape}')
+        err = yt - pred
+        pinball = torch.maximum(tau * err, (tau - 1) * err).mean()
+        penalty = model.l2_penalty()
+        (pinball + lam * penalty).backward()
+        optimizer.step()
+    return model, optimizer
+
+
+def fit_validation(spec, cache, return_forecasts=False):
+    """Warm-start weights and Adam across months; restart Adam for test."""
+    model = make_model(spec, cache[0][1].shape[1])
+    optimizer = None
     rows = []
-
-    for i, item in enumerate(cache):
-        if model is None:
-            model = make_model(spec, item["n_features"])
-            initialize_model(
-                model=model,
-                y_train=item["y_train_series"],
-                tau=spec.tau,
-            )
-            epochs = TRAINING_SETTINGS[spec.family]["epochs_initial"]
-        else:
-            epochs = TRAINING_SETTINGS[spec.family]["epochs_update"]
-
-        model = train_model(
-            model=model,
-            X_train_tensor=item["X_train_tensor"],
-            y_train_tensor=item["y_train_tensor"],
-            tau=spec.tau,
-            lam=spec.lam,
-            epochs=epochs,
-            lr=LEARNING_RATE,
-        )
-
-        with torch.no_grad():
-            forecast_std = float(
-                model(item["X_forecast_tensor"]).item()
-            )
-
-        forecast_raw = (
-            forecast_std * item["y_std"]
-            + item["y_mean"]
-        )
-
-        rows.append({
-            "date": item["date"],
-            "actual": item["actual_raw"],
-            f"q{spec.tau:.2f}": forecast_raw,
-            "family": spec.family,
-            "tau": spec.tau,
-            "nonlinear_layers": spec.nonlinear_layers,
-            "hidden_dim": spec.hidden_dim,
-            "alpha": spec.alpha,
-            "lambda": spec.lam,
-        })
-
-        if i % 100 == 0:
-            print(
-                f"    {spec.family}, tau={spec.tau:.2f}, "
-                f"layers={spec.nonlinear_layers}, "
-                f"dim={spec.hidden_dim}, alpha={spec.alpha}, "
-                f"lambda={spec.lam}: {i}/{len(cache)}"
-            )
-
-    return pd.DataFrame(rows).set_index("date")
+    for i, (date, xt, yt, xf, mean_y, actual) in enumerate(cache):
+        model, optimizer = train_model(model, xt, yt, float(spec['tau']),
+                                       float(spec['lambda']),
+                                       EPOCHS_FIRST if i <= 1 else EPOCHS_NEXT,
+                                       LR, optimizer=optimizer)
+        if return_forecasts:
+            with torch.no_grad():
+                pred = float(model(xf).item()) + mean_y
+            rows.append((date, actual, pred))
+    if return_forecasts:
+        return model, pd.DataFrame(rows, columns=['date', 'actual', 'prediction']).set_index('date')
+    return model, None
 
 
-# ---------------------------------------------------------------------
-# Complexity calculation
-# ---------------------------------------------------------------------
-
-def initial_sample_tensors() -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    pd.Series,
-]:
-    """
-    Fixed initial estimation sample: all observations strictly before 1980-01.
-
-    Standardization is computed using only this initial sample.
-    """
-    mask = X.index < VALIDATION_START
-
-    X_initial_raw = X.loc[mask].copy()
-    y_initial = y.loc[mask].copy()
-
-    if X_initial_raw.empty:
-        raise ValueError("No observations exist before 1980-01.")
-
-    # Apply the same predictor normalization used by 04 and 05.
-    X_initial_std, _ = standardize_train_forecast(
-        X_initial_raw,
-        X_initial_raw,
-    )
-
-    # Apply the same target standardization used by 04 and 05.
-    y_initial_std, _, _, _ = standardize_target_train_forecast(
-        y_initial,
-        float(y_initial.iloc[-1]),
-    )
-
-    X_tensor = torch.tensor(
-        X_initial_std.to_numpy(),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-    y_tensor = torch.tensor(
-        y_initial_std.to_numpy(),
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-
-    return X_tensor, y_tensor, y_initial_std
-
-
-def fitted_variance_for_candidate(spec: ModelSpec) -> float:
-    """
-    Fit one candidate once on the fixed pre-1980 sample and compute
-    the population variance (ddof=0) of its in-sample fitted quantiles.
-    """
-    np.random.seed(SEED)
-    torch.manual_seed(SEED)
-
-    X_tensor, y_tensor, y_series = initial_sample_tensors()
-
-    model = make_model(spec, X_tensor.shape[1])
-    initialize_model(model, y_series, spec.tau)
-
-    model = train_model(
-        model=model,
-        X_train_tensor=X_tensor,
-        y_train_tensor=y_tensor,
-        tau=spec.tau,
-        lam=spec.lam,
-        epochs=TRAINING_SETTINGS[spec.family]["epochs_initial"],
-        lr=LEARNING_RATE,
-    )
-
+def insample_variance(model, X, y, validation_cache):
+    """Match fred.py insamp_pred: final model, fixed validation-end scaling."""
+    dates = [item[0] for item in validation_cache]
+    cutoff = dates[-1]
+    # Original fred.py insamp_pred uses fixed end-of-validation scaling.
+    x_hist = X.loc[:cutoff].iloc[:-1]
+    y_hist = y.loc[:cutoff].iloc[:-1]
+    x_mean, x_std = x_hist.mean(), x_hist.std(ddof=1)
+    if x_std.isna().any() or (x_std == 0).any():
+        raise ValueError('Undefined predictor standard deviation at validation end')
+    x_eval = X.loc[dates].sub(x_mean).div(x_std)
     with torch.no_grad():
-        fitted = model(X_tensor).detach().cpu().numpy()
+        predictions = model(torch.as_tensor(x_eval.to_numpy(), dtype=torch.float32)).numpy()
+    predictions = np.asarray(predictions).reshape(-1) + float(y_hist.mean())
+    return float(np.var(predictions, ddof=0))
 
-    return float(np.var(fitted, ddof=0))
 
+def build_map(architectures, X, y, val_cache):
+    """Fit all architecture/lambda candidates, then select nearest variance.
 
-def read_full_lambda_search(family: str) -> pd.DataFrame:
+    The reference follows Domenico's test_script.py: first fitted variance
+    after stable sorting candidates by lambda. Because multiple lambda=0
+    candidates exist, the architecture ordering from the 04/05 search CSV is
+    retained and the chosen reference is saved explicitly for audit.
     """
-    Read and combine all seven per-quantile search files created by 04/05.
-
-    Each file must contain the complete architecture x 40-lambda grid.
-    No three-lambda subset is used anywhere in this script.
-    """
-    search_dir = FAMILIES[family]["search_dir"]
-
-    if not search_dir.exists():
-        raise FileNotFoundError(
-            f"Missing search directory: {search_dir}"
-        )
-
-    frames = []
-
-    for tau in QUANTILES:
-        path = search_dir / f"q{tau:.2f}_search.csv"
-
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Missing hyperparameter-search file: {path}"
-            )
-
-        frame = pd.read_csv(path)
-
-        required = {
-            "tau",
-            "nonlinear_layers",
-            "hidden_dim",
-            "alpha",
-            "lambda",
-            "validation_loss",
-        }
-        missing = required.difference(frame.columns)
-
-        if missing:
-            raise ValueError(
-                f"{path} is missing columns: {sorted(missing)}"
-            )
-
-        frame = frame.copy()
-        for column in ["tau", "lambda", "validation_loss"]:
-            frame[column] = pd.to_numeric(
-                frame[column], errors="coerce"
-            )
-
-        frame = frame.dropna(
-            subset=["tau", "lambda", "validation_loss"]
-        )
-        frame = frame[
-            np.isclose(frame["tau"].to_numpy(dtype=float), tau)
-        ].copy()
-
-        if frame.empty:
-            raise ValueError(
-                f"{path} contains no usable rows for tau={tau:.2f}."
-            )
-
-        lambda_values = frame["lambda"].to_numpy(dtype=float)
-        on_grid = np.isclose(
-            lambda_values[:, None],
-            np.asarray(LAMBDA_GRID, dtype=float)[None, :],
-            rtol=1e-8,
-            atol=1e-12,
-        ).any(axis=1)
-        frame = frame.loc[on_grid].copy()
-
-        unique_lambdas = np.sort(frame["lambda"].unique())
-        if len(unique_lambdas) != len(LAMBDA_GRID):
-            raise ValueError(
-                f"{path} contains {len(unique_lambdas)} distinct "
-                f"lambda values from the required grid; expected "
-                f"{len(LAMBDA_GRID)}. Rerun scripts 04/05 with the "
-                "full 40-lambda grid before running 08."
-            )
-
-        duplicate_keys = [
-            "tau",
-            "nonlinear_layers",
-            "hidden_dim",
-            "alpha",
-            "lambda",
-        ]
-        frame = (
-            frame.sort_values("validation_loss")
-            .drop_duplicates(subset=duplicate_keys, keep="first")
-            .reset_index(drop=True)
-        )
-
-        frames.append(frame)
-
-    df = pd.concat(frames, ignore_index=True)
-    df["family"] = family
-
-    expected_architectures = 7 if family == "linear_activation" else 18
-    expected_rows = (
-        len(QUANTILES)
-        * expected_architectures
-        * len(LAMBDA_GRID)
-    )
-
-    if len(df) != expected_rows:
-        raise ValueError(
-            f"Combined {family} search contains {len(df)} unique rows; "
-            f"expected {expected_rows} = {len(QUANTILES)} quantiles x "
-            f"{expected_architectures} architectures x "
-            f"{len(LAMBDA_GRID)} lambdas."
-        )
-
-    print(
-        f"Loaded {len(df)} {family} candidates from {search_dir}: "
-        f"{len(QUANTILES)} quantiles, {expected_architectures} "
-        f"architectures, and {len(LAMBDA_GRID)} lambdas."
-    )
-
-    return df
-
-def build_complexity_candidates(family: str) -> pd.DataFrame:
-    """
-    Compute each candidate's fitted variance and normalize it by the
-    fitted variance of the same architecture at lambda = 0.
-
-    Lambda = 0 is used only as the complexity reference. It is not added
-    to the validation-selection grid.
-    """
-    search = read_full_lambda_search(family)
-    candidate_variances = []
-    reference_variances = []
-
-    # Avoid fitting the same lambda=0 reference once for every penalized lambda.
-    zero_variance_cache: dict[tuple, float] = {}
-
-    total = len(search)
-
-    for index, row in search.iterrows():
-        spec = ModelSpec(
-            family=family,
-            tau=float(row["tau"]),
-            nonlinear_layers=int(row["nonlinear_layers"]),
-            hidden_dim=int(row["hidden_dim"]),
-            alpha=float(row["alpha"]),
-            lam=float(row["lambda"]),
-        )
-
-        print(
-            f"Complexity fit {index + 1}/{total}: "
-            f"{family}, tau={spec.tau:.2f}, "
-            f"layers={spec.nonlinear_layers}, "
-            f"dim={spec.hidden_dim}, alpha={spec.alpha}, "
-            f"lambda={spec.lam}"
-        )
-
-        candidate_variance = fitted_variance_for_candidate(spec)
-        candidate_variances.append(candidate_variance)
-
-        architecture_key = (
-            spec.family,
-            round(spec.tau, 8),
-            spec.nonlinear_layers,
-            spec.hidden_dim,
-            round(spec.alpha, 8),
-        )
-
-        if architecture_key not in zero_variance_cache:
-            zero_spec = ModelSpec(
-                family=spec.family,
-                tau=spec.tau,
-                nonlinear_layers=spec.nonlinear_layers,
-                hidden_dim=spec.hidden_dim,
-                alpha=spec.alpha,
-                lam=0.0,
-            )
-
-            print(
-                "  Computing lambda=0 reference for "
-                f"layers={spec.nonlinear_layers}, "
-                f"dim={spec.hidden_dim}, alpha={spec.alpha}"
-            )
-
-            zero_variance_cache[architecture_key] = (
-                fitted_variance_for_candidate(zero_spec)
-            )
-
-        reference_variances.append(
-            zero_variance_cache[architecture_key]
-        )
-
-    search["initial_fitted_variance"] = candidate_variances
-    search["lambda_zero_fitted_variance"] = reference_variances
-
-    denominator = search[
-        "lambda_zero_fitted_variance"
-    ].to_numpy(dtype=float)
-
-    numerator = search[
-        "initial_fitted_variance"
-    ].to_numpy(dtype=float)
-
-    # A complexity ratio is meaningful only when the unpenalized
-    # reference model has non-negligible fitted variation.
-    valid_reference = denominator >= MIN_REFERENCE_VARIANCE
-
-    achieved_r = np.full(
-        shape=numerator.shape,
-        fill_value=np.nan,
-        dtype=float,
-    )
-
-    np.divide(
-        numerator,
-        denominator,
-        out=achieved_r,
-        where=valid_reference,
-    )
-
-    # The paper defines complexity on [0, 1].
-    search["achieved_r"] = np.clip(
-        achieved_r,
-        0.0,
-        1.0,
-    )
-
-    search["valid_complexity_reference"] = valid_reference
-
-    invalid_count = int((~valid_reference).sum())
-
-    if invalid_count > 0:
-        print(
-            f"Excluded {invalid_count} candidate(s) because their "
-            f"lambda=0 fitted variance was below "
-            f"{MIN_REFERENCE_VARIANCE:.1e}."
-        )
-
-    output_path = (
-        CANDIDATE_DIR / f"{family}.csv"
-    )
-    search.to_csv(output_path, index=False)
-    print(f"Saved: {output_path}")
-
-    return search
-
-
-def map_target_complexities(
-    family: str,
-    candidates: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Choose one representative candidate nearest each target r.
-    """
-    rows = []
-
-    for tau in QUANTILES:
-        tau_candidates = candidates[
-            np.isclose(candidates["tau"], tau)
-            & candidates["valid_complexity_reference"]
-            & candidates["achieved_r"].notna()
-        ].copy()
-
-        if tau_candidates.empty:
-            raise ValueError(
-                f"No valid complexity candidates remain for "
-                f"family={family}, tau={tau:.2f}. "
-                f"All lambda=0 reference variances were below "
-                f"{MIN_REFERENCE_VARIANCE:.1e}."
-            )
-
-        for target_r in TARGET_R_GRID:
-            tau_candidates["distance_to_target_r"] = (
-                tau_candidates["achieved_r"] - target_r
-            ).abs()
-
-            chosen = tau_candidates.sort_values(
-                [
-                    "distance_to_target_r",
-                    "validation_loss",
-                    "lambda",
-                    "nonlinear_layers",
-                    "hidden_dim",
-                    "alpha",
-                ],
-                ascending=[True, True, True, True, True, True],
-            ).iloc[0]
-
-            rows.append({
-                "family": family,
-                "tau": tau,
-                "target_r": target_r,
-                "achieved_r": float(chosen["achieved_r"]),
-                "distance_to_target_r": float(
-                    chosen["distance_to_target_r"]
-                ),
-                "nonlinear_layers": int(
-                    chosen["nonlinear_layers"]
-                ),
-                "hidden_dim": int(chosen["hidden_dim"]),
-                "alpha": float(chosen["alpha"]),
-                "lambda": float(chosen["lambda"]),
-                "initial_fitted_variance": float(
-                    chosen["initial_fitted_variance"]
-                ),
-                "lambda_zero_fitted_variance": float(
-                    chosen["lambda_zero_fitted_variance"]
-                ),
-                "validation_loss": float(
-                    chosen["validation_loss"]
-                ),
-            })
-
-    mapping = pd.DataFrame(rows)
-
-    output_path = MAPPING_DIR / f"{family}.csv"
-    mapping.to_csv(output_path, index=False)
-    print(f"Saved: {output_path}")
-
-    return mapping
-
-
-# ---------------------------------------------------------------------
-# Naive benchmark and loss calculations
-# ---------------------------------------------------------------------
-
-def recursive_naive_forecasts(
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp | None,
-) -> pd.DataFrame:
-    """
-    Expanding-window unconditional empirical quantile forecasts.
-    """
-    if end_date is None:
-        dates = y.loc[start_date:].index
-    else:
-        dates = y.loc[start_date:end_date].index
-
-    rows = []
-
-    for date in dates:
-        y_history = y.loc[:date].iloc[:-1]
-
-        row = {
-            "date": date,
-            "actual": float(y.loc[date]),
-        }
-
-        for tau in QUANTILES:
-            row[f"q{tau:.2f}"] = float(
-                np.quantile(y_history.to_numpy(), tau)
-            )
-
-        rows.append(row)
-
-    return pd.DataFrame(rows).set_index("date")
-
-
-def pinball_loss(
-    actual: np.ndarray,
-    forecast: np.ndarray,
-    tau: float,
-) -> np.ndarray:
-    return pinball_loss_numpy(actual, forecast, tau)
-
-
-def average_pinball_loss(
-    forecast_df: pd.DataFrame,
-    tau: float,
-) -> float:
-    column = f"q{tau:.2f}"
-    losses = pinball_loss(
-        forecast_df["actual"].to_numpy(),
-        forecast_df[column].to_numpy(),
-        tau,
-    )
-    return float(np.mean(losses))
-
-
-def choose_hac_lag(n_obs: int) -> int:
-    if HAC_MAXLAGS is not None:
-        return int(HAC_MAXLAGS)
-
-    return max(
-        0,
-        int(math.floor(4.0 * (n_obs / 100.0) ** (2.0 / 9.0))),
-    )
-
-
-def hac_standard_error_of_mean(
-    values: Iterable[float],
-) -> float:
-    values = np.asarray(list(values), dtype=float)
-    values = values[np.isfinite(values)]
-
-    n_obs = len(values)
-
-    if n_obs < 2:
-        return np.nan
-
-    centered = values - values.mean()
-    max_lag = min(choose_hac_lag(n_obs), n_obs - 1)
-
-    long_run_variance = (
-        np.dot(centered, centered) / n_obs
-    )
-
-    for lag in range(1, max_lag + 1):
-        covariance = (
-            np.dot(centered[lag:], centered[:-lag])
-            / n_obs
-        )
-        weight = 1.0 - lag / (max_lag + 1.0)
-        long_run_variance += 2.0 * weight * covariance
-
-    return math.sqrt(
-        max(long_run_variance, 0.0) / n_obs
-    )
-
-
-# ---------------------------------------------------------------------
-# Representative recursive forecasts
-# ---------------------------------------------------------------------
-
-def row_to_spec(row: pd.Series) -> ModelSpec:
-    return ModelSpec(
-        family=str(row["family"]),
-        tau=float(row["tau"]),
-        nonlinear_layers=int(row["nonlinear_layers"]),
-        hidden_dim=int(row["hidden_dim"]),
-        alpha=float(row["alpha"]),
-        lam=float(row["lambda"]),
-    )
-
-
-def run_representative_forecasts(
-    family: str,
-    mapping: pd.DataFrame,
-    sample_name: str,
-    cache: list[dict],
-) -> Dict[Tuple, pd.DataFrame]:
-    """
-    Run only unique representative specifications.
-
-    If several target-r values map to the same candidate, that candidate
-    is trained once and its forecast path is reused.
-    """
-    sample_dir = FORECAST_DIR / sample_name / family
-    sample_dir.mkdir(parents=True, exist_ok=True)
-
-    forecasts_by_spec: Dict[Tuple, pd.DataFrame] = {}
-
-    unique_specs = (
-        mapping[
-            [
-                "family",
-                "tau",
-                "nonlinear_layers",
-                "hidden_dim",
-                "alpha",
-                "lambda",
-            ]
-        ]
-        .drop_duplicates()
-        .reset_index(drop=True)
-    )
-
-    print(
-        f"\n{family}, {sample_name}: "
-        f"{len(unique_specs)} unique representative specifications"
-    )
-
-    for i, row in unique_specs.iterrows():
-        spec = row_to_spec(row)
-
-        print(
-            f"\nRepresentative {i + 1}/{len(unique_specs)}: "
-            f"tau={spec.tau:.2f}, "
-            f"layers={spec.nonlinear_layers}, "
-            f"dim={spec.hidden_dim}, alpha={spec.alpha}, "
-            f"lambda={spec.lam}"
-        )
-
-        forecasts = recursive_forecasts(cache, spec)
-        forecasts_by_spec[spec.key] = forecasts
-
-        spec_file = (
-            sample_dir
-            / (
-                f"tau_{spec.tau:.2f}"
-                f"_layers_{spec.nonlinear_layers}"
-                f"_dim_{spec.hidden_dim}"
-                f"_alpha_{spec.alpha:g}"
-                f"_lambda_{spec.lam:g}.csv"
-            )
-        )
-        forecasts.to_csv(spec_file)
-
-    # Save target-r aliases as well, so each table row has an explicit file.
-    for _, row in mapping.iterrows():
-        spec = row_to_spec(row)
-        forecasts = forecasts_by_spec[spec.key]
-
-        target_file = (
-            sample_dir
-            / (
-                f"{family}_r{float(row['target_r']):.1f}"
-                f"_q{spec.tau:.2f}.csv"
-            )
-        )
-        forecasts.to_csv(target_file)
-
-    return forecasts_by_spec
-
-
-# ---------------------------------------------------------------------
-# Table construction
-# ---------------------------------------------------------------------
-
-def build_complexity_table(
-    family: str,
-    sample_name: str,
-    mapping: pd.DataFrame,
-    model_forecasts: Dict[Tuple, pd.DataFrame],
-    naive_forecasts: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build paper-style complexity-by-quantile table.
-
-    Row r=0:
-        normalized absolute naive loss
-
-    Rows r>0:
-        normalized model-minus-naive loss differential
-        with HAC standard error
-    """
-    detailed_rows = []
-    formatted_rows = []
-
-    # r = 0 benchmark row
-    benchmark_row = {
-        "family": family,
-        "sample": sample_name,
-        "complexity": 0.0,
-    }
-
-    for tau in QUANTILES:
-        normalization = tau * (1.0 - tau)
-
-        naive_loss_series = pinball_loss(
-            naive_forecasts["actual"].to_numpy(),
-            naive_forecasts[f"q{tau:.2f}"].to_numpy(),
-            tau,
-        )
-
-        estimate = (
-            np.mean(naive_loss_series)
-            / normalization
-            * DISPLAY_SCALE
-        )
-
-        benchmark_row[f"{tau:.2f}"] = f"{estimate:.2f}"
-
-        detailed_rows.append({
-            "family": family,
-            "sample": sample_name,
-            "target_r": 0.0,
-            "tau": tau,
-            "achieved_r": 0.0,
-            "estimate": estimate,
-            "hac_standard_error": np.nan,
-            "n_obs": len(naive_loss_series),
-            "nonlinear_layers": np.nan,
-            "hidden_dim": np.nan,
-            "alpha": np.nan,
-            "lambda": np.nan,
-            "validation_loss": np.nan,
-            "forecast_variance": float(
-                np.var(
-                    naive_forecasts[f"q{tau:.2f}"].to_numpy(),
-                    ddof=0,
-                )
-            ),
-            "actual_variance": float(
-                np.var(
-                    naive_forecasts["actual"].to_numpy(),
-                    ddof=0,
-                )
-            ),
-            "forecast_to_actual_variance_ratio": (
-                float(
-                    np.var(
-                        naive_forecasts[f"q{tau:.2f}"].to_numpy(),
-                        ddof=0,
-                    )
-                    / np.var(
-                        naive_forecasts["actual"].to_numpy(),
-                        ddof=0,
-                    )
-                )
-                if np.var(
-                    naive_forecasts["actual"].to_numpy(),
-                    ddof=0,
-                ) > 0
-                else np.nan
-            ),
-        })
-
-    formatted_rows.append(benchmark_row)
-
-    # r > 0 rows
-    for target_r in TARGET_R_GRID:
-        formatted_row = {
-            "family": family,
-            "sample": sample_name,
-            "complexity": target_r,
-        }
-
-        for tau in QUANTILES:
-            mapping_row = mapping[
-                np.isclose(mapping["tau"], tau)
-                & np.isclose(mapping["target_r"], target_r)
-            ].iloc[0]
-
-            spec = row_to_spec(mapping_row)
-            model_df = model_forecasts[spec.key]
-
-            aligned = naive_forecasts[
-                ["actual", f"q{tau:.2f}"]
-            ].rename(
-                columns={f"q{tau:.2f}": "naive_forecast"}
-            ).join(
-                model_df[[f"q{tau:.2f}"]].rename(
-                    columns={
-                        f"q{tau:.2f}": "model_forecast"
-                    }
-                ),
-                how="inner",
-            )
-
-            naive_losses = pinball_loss(
-                aligned["actual"].to_numpy(),
-                aligned["naive_forecast"].to_numpy(),
-                tau,
-            )
-
-            model_losses = pinball_loss(
-                aligned["actual"].to_numpy(),
-                aligned["model_forecast"].to_numpy(),
-                tau,
-            )
-
-            normalized_differential = (
-                (model_losses - naive_losses)
-                / (tau * (1.0 - tau))
-                * DISPLAY_SCALE
-            )
-
-            estimate = float(
-                np.mean(normalized_differential)
-            )
-            standard_error = float(
-                hac_standard_error_of_mean(
-                    normalized_differential
-                )
-            )
-
-            formatted_row[f"{tau:.2f}"] = (
-                f"{estimate:.2f}\n"
-                f"({standard_error:.2f})"
-            )
-
-            detailed_rows.append({
-                "family": family,
-                "sample": sample_name,
-                "target_r": target_r,
-                "tau": tau,
-                "achieved_r": float(
-                    mapping_row["achieved_r"]
-                ),
-                "distance_to_target_r": float(
-                    mapping_row["distance_to_target_r"]
-                ),
-                "estimate": estimate,
-                "hac_standard_error": standard_error,
-                "n_obs": len(aligned),
-                "nonlinear_layers": int(
-                    mapping_row["nonlinear_layers"]
-                ),
-                "hidden_dim": int(
-                    mapping_row["hidden_dim"]
-                ),
-                "alpha": float(mapping_row["alpha"]),
-                "lambda": float(mapping_row["lambda"]),
-                "validation_loss": float(
-                    mapping_row["validation_loss"]
-                ),
-                "forecast_variance": float(
-                    np.var(
-                        aligned["model_forecast"].to_numpy(),
-                        ddof=0,
-                    )
-                ),
-                "actual_variance": float(
-                    np.var(
-                        aligned["actual"].to_numpy(),
-                        ddof=0,
-                    )
-                ),
-                "forecast_to_actual_variance_ratio": (
-                    float(
-                        np.var(
-                            aligned["model_forecast"].to_numpy(),
-                            ddof=0,
-                        )
-                        / np.var(
-                            aligned["actual"].to_numpy(),
-                            ddof=0,
-                        )
-                    )
-                    if np.var(
-                        aligned["actual"].to_numpy(),
-                        ddof=0,
-                    ) > 0
-                    else np.nan
-                ),
-            })
-
-        formatted_rows.append(formatted_row)
-
-    detailed = pd.DataFrame(detailed_rows)
-    formatted = pd.DataFrame(formatted_rows)
-
-    return detailed, formatted
-
-
-def save_table_outputs(
-    family: str,
-    sample_name: str,
-    detailed: pd.DataFrame,
-    formatted: pd.DataFrame,
-) -> None:
-    detailed_path = (
-        TABLE_DIR
-        / f"table_{sample_name}_{family}_detailed.csv"
-    )
-    formatted_path = (
-        TABLE_DIR
-        / f"table_{sample_name}_{family}_formatted.csv"
-    )
-    latex_path = (
-        TABLE_DIR
-        / f"table_{sample_name}_{family}.tex"
-    )
-
-    detailed.to_csv(detailed_path, index=False)
-    formatted.to_csv(formatted_path, index=False)
-
-    formatted.to_latex(
-        latex_path,
-        index=False,
-        escape=False,
-        column_format="lll" + "c" * len(QUANTILES),
-        caption=(
-            f"{sample_name.title()} forecast accuracy by "
-            f"complexity for {family}."
-        ),
-        label=f"tab:{sample_name}_{family}",
-    )
-
-    print(f"\nSaved: {detailed_path}")
-    print(f"Saved: {formatted_path}")
-    print(f"Saved: {latex_path}")
-
-    print("\n" + "=" * 90)
-    print(f"{sample_name.upper()} TABLE: {family}")
-    print("=" * 90)
-    print(formatted.to_string(index=False))
-
-
-# ---------------------------------------------------------------------
-# Forecast diagnostic plots
-# ---------------------------------------------------------------------
-
-def shade_recessions(
-    axis: plt.Axes,
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-) -> None:
-    """
-    Shade NBER recession months that overlap the displayed sample.
-    """
-    first_label = True
-
-    for recession_start, recession_end in NBER_RECESSIONS:
-        if recession_end < start_date or recession_start > end_date:
-            continue
-
-        axis.axvspan(
-            max(recession_start, start_date),
-            min(recession_end, end_date),
-            alpha=0.16,
-            label="NBER recession" if first_label else None,
-        )
-        first_label = False
-
-
-def assemble_quantile_forecast_frame(
-    family: str,
-    mapping: pd.DataFrame,
-    model_forecasts: Dict[Tuple, pd.DataFrame],
-    actual_source: pd.DataFrame,
-    target_r: float,
-) -> pd.DataFrame:
-    """
-    Assemble one actual series and the seven representative quantile
-    forecasts nearest the requested target complexity.
-    """
-    frame = actual_source[["actual"]].copy()
-
-    for tau in QUANTILES:
-        row = mapping[
-            np.isclose(mapping["tau"], tau)
-            & np.isclose(mapping["target_r"], target_r)
-        ]
-
-        if row.empty:
-            raise ValueError(
-                f"No mapping found for {family}, tau={tau:.2f}, "
-                f"target_r={target_r:.1f}."
-            )
-
-        spec = row_to_spec(row.iloc[0])
-        forecast_df = model_forecasts[spec.key]
-        frame = frame.join(
-            forecast_df[[f"q{tau:.2f}"]],
-            how="inner",
-        )
-
-    return frame
-
-
-def save_forecast_diagnostic_plot(
-    family: str,
-    sample_name: str,
-    mapping: pd.DataFrame,
-    model_forecasts: Dict[Tuple, pd.DataFrame],
-    actual_source: pd.DataFrame,
-    target_r: float = PLOT_TARGET_R,
-) -> None:
-    """
-    Plot actual unemployment changes and all seven quantile forecasts,
-    with recession periods shaded.
-    """
-    frame = assemble_quantile_forecast_frame(
-        family=family,
-        mapping=mapping,
-        model_forecasts=model_forecasts,
-        actual_source=actual_source,
-        target_r=target_r,
-    )
-
-    figure, axis = plt.subplots(figsize=(15, 7))
-
-    shade_recessions(
-        axis,
-        start_date=frame.index.min(),
-        end_date=frame.index.max(),
-    )
-
-    axis.plot(
-        frame.index,
-        frame["actual"],
-        linewidth=1.2,
-        label="Actual",
-    )
-
-    # Outer and inner forecast intervals.
-    axis.fill_between(
-        frame.index,
-        frame["q0.05"],
-        frame["q0.95"],
-        alpha=0.12,
-        label="5–95% forecast range",
-    )
-    axis.fill_between(
-        frame.index,
-        frame["q0.25"],
-        frame["q0.75"],
-        alpha=0.22,
-        label="25–75% forecast range",
-    )
-
-    axis.plot(
-        frame.index,
-        frame["q0.50"],
-        linewidth=1.2,
-        label="Median forecast",
-    )
-    axis.plot(
-        frame.index,
-        frame["q0.10"],
-        linewidth=0.8,
-        linestyle="--",
-        label="10th percentile",
-    )
-    axis.plot(
-        frame.index,
-        frame["q0.90"],
-        linewidth=0.8,
-        linestyle="--",
-        label="90th percentile",
-    )
-
-    axis.axhline(0.0, linewidth=0.7)
-    axis.set_title(
-        f"{sample_name.title()} Forecasts — "
-        f"{family.replace('_', ' ').title()} "
-        f"(target r={target_r:.1f})"
-    )
-    axis.set_xlabel("Date")
-    axis.set_ylabel("One-month-ahead unemployment-rate change")
-    axis.legend(loc="best", ncol=2)
-    axis.grid(alpha=0.2)
-
-    figure.tight_layout()
-
-    output_path = (
-        FORECAST_PLOT_DIR
-        / f"{sample_name}_{family}_r{target_r:.1f}.png"
-    )
-    figure.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(figure)
-    print(f"Saved: {output_path}")
-
-
-
-# ---------------------------------------------------------------------
-# Final table figures
-# ---------------------------------------------------------------------
-
-def clean_table_figure_directory() -> None:
-    """Remove old PNG/PDF table figures before saving the three final PNGs."""
-    for path in TABLE_FIGURE_DIR.iterdir():
-        if path.is_file() and path.suffix.lower() in {".png", ".pdf"}:
-            path.unlink()
-
-
-def display_table_frame(formatted: pd.DataFrame) -> pd.DataFrame:
-    columns = ["complexity"] + [f"{tau:.2f}" for tau in QUANTILES]
-    frame = formatted.loc[:, columns].copy()
-    return frame.rename(columns={"complexity": "r"})
-
-
-def draw_formatted_table(axis, formatted: pd.DataFrame, title: str) -> None:
-    frame = display_table_frame(formatted)
-    axis.axis("off")
-    axis.set_title(title, fontsize=13, fontweight="bold", pad=12)
-    table = axis.table(
-        cellText=frame.astype(str).values,
-        colLabels=frame.columns,
-        cellLoc="center",
-        colLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(7.5)
-    table.scale(1.0, 1.8)
-    for (row, _column), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_text_props(fontweight="bold")
-        cell.set_linewidth(0.6)
-
-
-def save_side_by_side_figure(linear_table, dnn_table, sample_name: str, filename: str) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(24, 10))
-    draw_formatted_table(axes[0], linear_table, f"{sample_name.title()} Sample — Linear Activation")
-    draw_formatted_table(axes[1], dnn_table, f"{sample_name.title()} Sample — DNN")
-    figure.tight_layout()
-    output_path = TABLE_FIGURE_DIR / filename
-    figure.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(figure)
-    print(f"Saved: {output_path}")
-
-
-def save_four_panel_figure(validation_linear, validation_dnn, test_linear, test_dnn) -> None:
-    figure, axes = plt.subplots(2, 2, figsize=(24, 18))
-    draw_formatted_table(axes[0, 0], validation_linear, "Validation Sample — Linear Activation")
-    draw_formatted_table(axes[0, 1], validation_dnn, "Validation Sample — DNN")
-    draw_formatted_table(axes[1, 0], test_linear, "Test Sample — Linear Activation")
-    draw_formatted_table(axes[1, 1], test_dnn, "Test Sample — DNN")
-    figure.tight_layout()
-    output_path = TABLE_FIGURE_DIR / "complexity_tables_linear_vs_dnn.png"
-    figure.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(figure)
-    print(f"Saved: {output_path}")
-
-
-def save_final_table_figures(tables: Dict[Tuple[str, str], pd.DataFrame]) -> None:
-    clean_table_figure_directory()
-    validation_linear = tables[("linear_activation", "validation")]
-    validation_dnn = tables[("dnn", "validation")]
-    test_linear = tables[("linear_activation", "test")]
-    test_dnn = tables[("dnn", "test")]
-    save_side_by_side_figure(validation_linear, validation_dnn, "validation", "table_2_validation_linear_vs_dnn.png")
-    save_side_by_side_figure(test_linear, test_dnn, "test", "table_3_test_linear_vs_dnn.png")
-    save_four_panel_figure(validation_linear, validation_dnn, test_linear, test_dnn)
-
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
-
-def main() -> None:
-    formatted_tables: Dict[Tuple[str, str], pd.DataFrame] = {}
-
-    print("\nBuilding validation cache...")
-    validation_cache = build_forecast_cache(
-        VALIDATION_START,
-        VALIDATION_END,
-    )
-
-    print("\nBuilding test cache...")
-    test_cache = build_forecast_cache(
-        TEST_START,
-        TEST_END,
-    )
-
-    print("\nBuilding naive validation forecasts...")
-    naive_validation = recursive_naive_forecasts(
-        VALIDATION_START,
-        VALIDATION_END,
-    )
-
-    print("\nBuilding naive test forecasts...")
-    naive_test = recursive_naive_forecasts(
-        TEST_START,
-        TEST_END,
-    )
-
-    naive_validation.to_csv(
-        BENCHMARK_DIR / "naive_validation_forecasts.csv"
-    )
-    naive_test.to_csv(
-        BENCHMARK_DIR / "naive_test_forecasts.csv"
-    )
-
+    grid = np.array([0.0] + [float(f'{v:.3f}') for v in
+                     np.geomspace(0.02, 10.0, 40)], dtype=float)
+    if len(np.unique(grid)) != len(grid):
+        raise ValueError('Rounded regularization grid contains duplicates')
+    all_mappings = {}
     for family in FAMILIES:
-        print("\n" + "#" * 100)
-        print(f"FAMILY: {family}")
-        print("#" * 100)
-
-        candidates = build_complexity_candidates(family)
-        mapping = map_target_complexities(
-            family,
-            candidates,
-        )
-
-        validation_forecasts = run_representative_forecasts(
-            family=family,
-            mapping=mapping,
-            sample_name="validation",
-            cache=validation_cache,
-        )
-
-        test_forecasts = run_representative_forecasts(
-            family=family,
-            mapping=mapping,
-            sample_name="test",
-            cache=test_cache,
-        )
-
-        save_forecast_diagnostic_plot(
-            family=family,
-            sample_name="validation",
-            mapping=mapping,
-            model_forecasts=validation_forecasts,
-            actual_source=naive_validation,
-        )
-
-        save_forecast_diagnostic_plot(
-            family=family,
-            sample_name="test",
-            mapping=mapping,
-            model_forecasts=test_forecasts,
-            actual_source=naive_test,
-        )
-
-        validation_detailed, validation_formatted = (
-            build_complexity_table(
-                family=family,
-                sample_name="validation",
-                mapping=mapping,
-                model_forecasts=validation_forecasts,
-                naive_forecasts=naive_validation,
-            )
-        )
-
-        test_detailed, test_formatted = (
-            build_complexity_table(
-                family=family,
-                sample_name="test",
-                mapping=mapping,
-                model_forecasts=test_forecasts,
-                naive_forecasts=naive_test,
-            )
-        )
-
-        save_table_outputs(
-            family,
-            "validation",
-            validation_detailed,
-            validation_formatted,
-        )
-
-        save_table_outputs(
-            family,
-            "test",
-            test_detailed,
-            test_formatted,
-        )
-
-        formatted_tables[(family, "validation")] = validation_formatted
-        formatted_tables[(family, "test")] = test_formatted
-
-    print("\nSaving final table figures...")
-    save_final_table_figures(formatted_tables)
-
-    print("\nComplexity mapping and tables complete.")
+        mapped = []
+        for tau in TAUS:
+            group = architectures.loc[
+                (architectures.family == family) & np.isclose(architectures.tau, tau)
+            ]
+            if group.empty:
+                raise ValueError(f'No architectures for {family} q{tau:.2f}')
+            saved = directory('insamp', family, f'q{tau:.2f}')
+            values = []
+            for arch in group.to_dict('records'):
+                for j, lam in enumerate(grid):
+                    spec = {k: arch[k] for k in
+                            ('family', 'tau', 'nonlinear_layers', 'hidden_dim', 'alpha')}
+                    spec['lambda'] = float(lam)
+                    file = saved / f'{CACHE_VERSION}_{spec_id(spec)}.json'
+                    if file.exists():
+                        record = json.loads(file.read_text())
+                        if any(record.get(k) != v for k, v in spec.items()):
+                            raise ValueError(f'Cache specification mismatch: {file}')
+                    else:
+                        model, _ = fit_validation(spec, val_cache)
+                        var = insample_variance(model, X, y, val_cache)
+                        record = dict(**spec, variance=var, cache_version=CACHE_VERSION)
+                        file.write_text(json.dumps(record))
+                    if record.get('cache_version') != CACHE_VERSION:
+                        raise ValueError(f'Cache version mismatch: {file}')
+                    record = dict(record)
+                    record['validation_loss'] = arch['best_validation_loss']
+                    values.append(record)
+                print(f'{family} q{tau:.2f}: fitted/cached {len(values)} '
+                      f'of {len(group)*len(grid)} candidates', flush=True)
+            candidates = pd.DataFrame(values).sort_values('lambda', kind='stable').reset_index(drop=True)
+            if float(candidates.iloc[0]['lambda']) != 0.0:
+                raise AssertionError('Expected lambda=0 reference')
+            reference = float(candidates.iloc[0].variance)
+            if not np.isfinite(reference) or reference <= 1e-12:
+                raise ValueError(f'{family} q{tau:.2f}: invalid reference variance')
+            candidates['achieved_r'] = candidates.variance / reference
+            candidates['reference_variance'] = reference
+            candidates.to_csv(directory('candidates') / f'{family}_q{tau:.2f}_insamp.csv', index=False)
+            ref = candidates.iloc[0]
+            print(f'REFERENCE {family} q{tau:.2f}: layers={int(ref.nonlinear_layers)}, '
+                  f'dim={int(ref.hidden_dim)}, alpha={ref.alpha}, '
+                  f'lambda={ref["lambda"]}, variance={reference:.8g}', flush=True)
+            for r in R_GRID:
+                ii = int(np.argmin(np.abs(candidates.variance.to_numpy() - r * reference)))
+                choice = candidates.iloc[ii]
+                record = choice.to_dict()
+                record.update(target_r=float(r),
+                              distance_to_target_r=abs(float(choice.achieved_r)-r))
+                mapped.append(record)
+                if record['distance_to_target_r'] > .06:
+                    print(f'WARNING {family} q{tau:.2f} target={r:.1f} '
+                          f'achieved={record["achieved_r"]:.3f}', flush=True)
+        result = pd.DataFrame(mapped)
+        result.to_csv(directory('mappings') / f'{family}.csv', index=False)
+        all_mappings[family] = result
+    return all_mappings
 
 
-if __name__ == "__main__":
+def naive(cache):
+    return pd.DataFrame([(date, actual) for date, _, _, _, _, actual in cache],
+                        columns=['date', 'actual']).set_index('date')
+
+
+def benchmark(y, dates, tau):
+    return np.array([np.quantile(y.loc[:d].iloc[:-1].to_numpy(), tau) for d in dates])
+
+
+def hac_se(d):
+    d = np.asarray(d, dtype=float)
+    n = len(d)
+    if n < 2:
+        return np.nan
+    z = d - d.mean()
+    lagmax = min(n-1, int(math.floor(4*(n/100)**(2/9))))
+    lrv = z @ z / n
+    for k in range(1, lagmax+1):
+        lrv += 2*(1-k/(lagmax+1))*(z[k:] @ z[:-k])/n
+    return math.sqrt(max(0, lrv)/n)
+
+
+def test_forecast(model, spec, cache):
+    optimizer = None  # Original fred.py restarts Adam at validation/test boundary.
+    rows = []
+    for date, xt, yt, xf, mean_y, actual in cache:
+        model, optimizer = train_model(model, xt, yt, float(spec['tau']),
+                                       float(spec['lambda']), EPOCHS_NEXT, LR,
+                                       optimizer=optimizer)
+        with torch.no_grad():
+            pred = float(model(xf).item()) + mean_y
+        rows.append((date, actual, pred))
+    return pd.DataFrame(rows, columns=['date', 'actual', 'prediction']).set_index('date')
+
+
+def create_tables(mappings, X, y, val_cache, test_cache):
+    for family, mapping in mappings.items():
+        forecast_folder = directory('forecasts', family)
+        paths = {}
+        unique = mapping.drop_duplicates(subset=['tau','nonlinear_layers','hidden_dim','alpha','lambda'])
+        for i, row in enumerate(unique.to_dict('records')):
+            spec = {k: row[k] for k in ('family', 'tau', 'nonlinear_layers', 'hidden_dim', 'alpha', 'lambda')}
+            sid = spec_id(spec)
+            vf, tf = forecast_folder / f'{sid}_validation.csv', forecast_folder / f'{sid}_test.csv'
+            if not (vf.exists() and tf.exists()):
+                print(f'{family} selected forecast {i+1}/{len(unique)}: {spec}', flush=True)
+                model, val = fit_validation(spec, val_cache, return_forecasts=True)
+                test = test_forecast(model, spec, test_cache)
+                val.to_csv(vf)
+                test.to_csv(tf)
+            paths[sid] = (vf, tf)
+        for sample, cache, which in [('validation', val_cache, 0), ('test', test_cache, 1)]:
+            actual = naive(cache)
+            dates = actual.index
+            detailed, formatted = [], []
+            naive_losses = {}
+            for tau in TAUS:
+                base = benchmark(y, dates, tau)
+                naive_losses[tau] = pinball_loss_numpy(actual.actual.to_numpy(), base, tau)
+            zero = dict(family=family, sample=sample, complexity=0.)
+            for tau in TAUS:
+                estimate = float(100 * np.mean(naive_losses[tau]) / (tau*(1-tau)))
+                zero[f'{tau:.2f}'] = f'{estimate:.2f}'
+                detailed.append(dict(family=family, sample=sample, target_r=0., tau=tau,
+                                     achieved_r=0., estimate=estimate, hac_standard_error=np.nan,
+                                     n_obs=len(dates)))
+            formatted.append(zero)
+            for r in R_GRID:
+                line = dict(family=family, sample=sample, complexity=float(r))
+                for tau in TAUS:
+                    row = mapping[np.isclose(mapping.tau, tau) & np.isclose(mapping.target_r, r)].iloc[0]
+                    spec = {k: row[k] for k in ('family','tau','nonlinear_layers','hidden_dim','alpha','lambda')}
+                    f = pd.read_csv(paths[spec_id(spec)][which], index_col=0, parse_dates=True)
+                    f = f.reindex(dates)
+                    if f.prediction.isna().any():
+                        raise ValueError(f'Forecast dates missing: {spec}, {sample}')
+                    loss = pinball_loss_numpy(actual.actual.to_numpy(), f.prediction.to_numpy(), tau)
+                    differential = 100*(loss-naive_losses[tau])/(tau*(1-tau))
+                    estimate, se = float(np.mean(differential)), float(hac_se(differential))
+                    line[f'{tau:.2f}'] = f'{estimate:.2f}\n({se:.2f})'
+                    detailed.append(dict(family=family, sample=sample, target_r=float(r), tau=tau,
+                                         achieved_r=float(row.achieved_r),
+                                         distance_to_target_r=float(row.distance_to_target_r),
+                                         estimate=estimate, hac_standard_error=se, n_obs=len(dates),
+                                         nonlinear_layers=int(row.nonlinear_layers), hidden_dim=int(row.hidden_dim),
+                                         alpha=float(row.alpha), **{'lambda': float(row['lambda'])}))
+                formatted.append(line)
+            stem = directory('tables') / f'table_{sample}_{family}'
+            pd.DataFrame(detailed).to_csv(f'{stem}_detailed.csv', index=False)
+            pd.DataFrame(formatted).to_csv(f'{stem}_formatted.csv', index=False)
+            print(f'Saved {stem}_formatted.csv', flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stage', choices=['map', 'tables', 'all'], default='all')
+    args = parser.parse_args()
+    X, y = load_replication_data()
+    if X.isna().any().any() or y.isna().any():
+        raise ValueError('Dataset contains NaNs; clean data before training')
+    val_cache = prepare_cache(X, y, START_VAL, END_VAL)
+    if args.stage in ('map', 'all'):
+        architectures = search_architectures()
+        mappings = build_map(architectures, X, y, val_cache)
+    else:
+        mappings = {f: pd.read_csv(ROOT / 'mappings' / f'{f}.csv') for f in FAMILIES}
+    if args.stage in ('tables', 'all'):
+        test_cache = prepare_cache(X, y, START_TEST, END_TEST)
+        create_tables(mappings, X, y, val_cache, test_cache)
+
+
+if __name__ == '__main__':
     main()

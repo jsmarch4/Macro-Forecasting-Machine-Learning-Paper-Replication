@@ -16,11 +16,12 @@ quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95]
 
 # Out-of-sample period
 forecast_start = "1980-01-01"
+forecast_end = "2019-12-01"
 
 # Store forecasts
 forecasts = []
 
-for date in y.loc[forecast_start:].index:
+for date in y.loc[forecast_start:forecast_end].index:
     # Only use information before the forecast date
     past_y = y.loc[:date].iloc[:-1]
 

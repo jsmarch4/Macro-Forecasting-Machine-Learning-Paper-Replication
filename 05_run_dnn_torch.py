@@ -68,9 +68,9 @@ args = parser.parse_args()
 
 tau = float(args.quantile)
 
-VALIDATION_START = "1980-01-01"
-VALIDATION_END = "1999-12-01"
-TEST_START = "2000-01-01"
+VALIDATION_START = "1980-02-01"
+VALIDATION_END = "2000-01-01"
+TEST_START = "2000-02-01"
 TEST_END = "2019-12-01"
 
 # Paper-style 40-point log-spaced lambda grid.
@@ -85,31 +85,31 @@ ARCHITECTURE_GRID = [
     for alpha in [0.0, 0.5, 1.0]
 ]
 
-EPOCHS_INITIAL = 750
-EPOCHS_UPDATE = 150
-LEARNING_RATE = 0.0001
+EPOCHS_INITIAL = 500
+EPOCHS_UPDATE = 100
+LEARNING_RATE = 0.001
 
 
 # ---------------------------------------------------------------------
 # Model and forecast helpers
 # ---------------------------------------------------------------------
 
-def initialize_model(
-    model: QuantileNetwork,
-    y_train: pd.Series,
-    tau_value: float,
-) -> None:
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if "weight" in name:
-                parameter.normal_(mean=0.0, std=0.01)
-            elif "bias" in name:
-                parameter.zero_()
+# def initialize_model(
+#     model: QuantileNetwork,
+#     y_train: pd.Series,
+#     tau_value: float,
+# ) -> None:
+#     with torch.no_grad():
+#         for name, parameter in model.named_parameters():
+#             if "weight" in name:
+#                 parameter.normal_(mean=0.0, std=0.01)
+#             elif "bias" in name:
+#                 parameter.zero_()
 
-        final_layer = model.network[-1]
-        final_layer.bias.fill_(
-            float(np.quantile(y_train.to_numpy(), tau_value))
-        )
+#         final_layer = model.network[-1]
+#         final_layer.bias.fill_(
+#             float(np.quantile(y_train.to_numpy(), tau_value))
+#         )
 
 
 def build_forecast_cache(
@@ -180,9 +180,11 @@ def recursive_forecasts(
     hidden_dim: int,
     alpha: float,
     lr: float,
-) -> pd.DataFrame:
+    model = None,
+) -> tuple[pd.DataFrame, QuantileNetwork]:
     rows = []
-    model = None
+    optimizer = None  # Keep Adam state across monthly updates.
+    fresh_validation_run = model is None
 
     for i, item in enumerate(forecast_cache):
         if model is None:
@@ -193,16 +195,13 @@ def recursive_forecasts(
                 alpha=alpha,
             ).to(DEVICE)
 
-            initialize_model(
-                model,
-                item["y_train_series"],
-                tau_value,
-            )
             epochs = EPOCHS_INITIAL
         else:
-            epochs = EPOCHS_UPDATE
+            # fred.py uses initial_epochs at T0 and T0+1.
+            # When continuing into test, the model already exists.
+            epochs = EPOCHS_INITIAL if fresh_validation_run and i == 1 else EPOCHS_UPDATE
 
-        model = train_model(
+        model, optimizer = train_model(
             model=model,
             X_train_tensor=item["X_train_tensor"],
             y_train_tensor=item["y_train_tensor"],
@@ -210,6 +209,7 @@ def recursive_forecasts(
             lam=float(lam),
             epochs=epochs,
             lr=lr,
+            optimizer=optimizer
         )
 
         with torch.no_grad():
@@ -218,15 +218,14 @@ def recursive_forecasts(
             )
 
         forecast_raw = (
-            forecast_std * item["y_std"]
-            + item["y_mean"]
+            forecast_std + item["y_mean"]
         )
 
         rows.append({
             "date": item["date"],
-            f"q{tau_value:.2f}": forecast_std,
+            f"q{tau_value:.2f}": forecast_raw,
             f"q{tau_value:.2f}_raw": forecast_raw,
-            "actual": item["actual"],
+            "actual": item["actual_raw"],
             "actual_raw": item["actual_raw"],
             "lambda": float(lam),
             "nonlinear_layers": nonlinear_layers,
@@ -237,7 +236,7 @@ def recursive_forecasts(
         if i % 100 == 0:
             print(f"  Forecast {i}/{len(forecast_cache)}")
 
-    return pd.DataFrame(rows).set_index("date")
+    return pd.DataFrame(rows).set_index("date"), model
 
 
 # ---------------------------------------------------------------------
@@ -259,6 +258,7 @@ test_cache = build_forecast_cache(
 validation_results = []
 best_validation_loss = float("inf")
 best_validation_forecasts = None
+best_validation_model = None
 
 total_models = len(ARCHITECTURE_GRID) * len(LAMBDA_GRID)
 model_number = 0
@@ -285,7 +285,7 @@ for architecture in ARCHITECTURE_GRID:
             f"lambda={lam:.12g}"
         )
 
-        validation_forecasts = recursive_forecasts(
+        validation_forecasts, model = recursive_forecasts(
             forecast_cache=validation_cache,
             lam=float(lam),
             tau_value=tau,
@@ -307,7 +307,7 @@ for architecture in ARCHITECTURE_GRID:
                 f"learning rate {retry_learning_rate}."
             )
 
-            validation_forecasts = recursive_forecasts(
+            validation_forecasts, model = recursive_forecasts(
                 forecast_cache=validation_cache,
                 lam=float(lam),
                 tau_value=tau,
@@ -346,6 +346,7 @@ for architecture in ARCHITECTURE_GRID:
         if validation_loss < best_validation_loss:
             best_validation_loss = float(validation_loss)
             best_validation_forecasts = validation_forecasts.copy()
+            best_validation_model = model
 
 validation_results_df = pd.DataFrame(validation_results)
 
@@ -388,7 +389,7 @@ print(
 
 print("\nRunning out-of-sample test...")
 
-test_forecasts = recursive_forecasts(
+test_forecasts, _ = recursive_forecasts(
     forecast_cache=test_cache,
     lam=best_lambda,
     tau_value=tau,
@@ -396,29 +397,14 @@ test_forecasts = recursive_forecasts(
     hidden_dim=best_hidden_dim,
     alpha=best_alpha,
     lr=LEARNING_RATE,
+    model=best_validation_model,
 )
 
 test_loss = float(average_pinball_loss(test_forecasts, tau))
 
 if not np.isfinite(test_loss):
-    retry_learning_rate = 0.0001
-    print(
-        "Non-finite test loss; retrying selected model with "
-        f"learning rate {retry_learning_rate}."
-    )
-
-    test_forecasts = recursive_forecasts(
-        forecast_cache=test_cache,
-        lam=best_lambda,
-        tau_value=tau,
-        nonlinear_layers=best_nonlinear_layers,
-        hidden_dim=best_hidden_dim,
-        alpha=best_alpha,
-        lr=retry_learning_rate,
-    )
-
-    test_loss = float(
-        average_pinball_loss(test_forecasts, tau)
+    raise RuntimeError(
+        f"Non-finite test loss for tau={tau:.2f}."
     )
 
 if not np.isfinite(test_loss):

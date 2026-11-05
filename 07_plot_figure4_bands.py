@@ -18,14 +18,14 @@ QUANTILES = [0.05, 0.25, 0.50, 0.75, 0.95]
 
 VALIDATION_START = pd.Timestamp("1980-01-01")
 TEST_START = pd.Timestamp("2000-01-01")
-PLOT_END = pd.Timestamp("2019-12-01")
+PLOT_END = pd.Timestamp("2024-01-01")
 
 ZOOM_Y_MIN = -2.0
 ZOOM_Y_MAX = 2.0
 
 TARGET_LABEL = (
     "Monthly Change in Unemployment Rate "
-    "(percentage points)"
+    "(globally standardized units)"
 )
 
 NBER_RECESSIONS = [
@@ -48,31 +48,10 @@ def read_forecast_file(
     df = pd.read_csv(file_path, parse_dates=["date"])
 
     standard_column = f"q{quantile:.2f}"
-    raw_column = f"q{quantile:.2f}_raw"
-
-    if raw_column in df.columns and "actual_raw" in df.columns:
-        result = df[["date", raw_column, "actual_raw"]].copy()
-        return result.rename(
-            columns={
-                raw_column: standard_column,
-                "actual_raw": "actual",
-            }
-        )
-
     required = {"date", standard_column, "actual"}
     missing = required.difference(df.columns)
-
     if missing:
-        raise ValueError(
-            f"{file_path} is missing raw columns "
-            f"({raw_column}, actual_raw) and fallback columns: "
-            f"{sorted(missing)}"
-        )
-
-    print(
-        f"Warning: {file_path.name} has no *_raw columns; "
-        "using qXX and actual as stored."
-    )
+        raise ValueError(f"{file_path} is missing columns: {sorted(missing)}")
     return df[["date", standard_column, "actual"]].copy()
 
 

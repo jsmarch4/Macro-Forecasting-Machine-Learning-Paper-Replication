@@ -241,7 +241,7 @@ def save_sample_comparison(sample, table_number):
     sample_title = (
         "Validation Sample (1980–1999)"
         if sample == "validation"
-        else "Test Sample (2000–2024)"
+        else "Test Sample (2000–2019)"
     )
 
     fig.suptitle(
